@@ -17,20 +17,26 @@ import {
   CheckCircle2,
   CloudUpload,
   CopyCheck,
+  Download,
+  FileUp,
   ImageUp,
+  KeyRound,
   RefreshCw,
   RotateCcw,
   ShieldCheck,
   Smartphone,
   WifiOff,
 } from 'lucide-react';
+import { generateProtectedOfflineHtml } from '../lib/offlineHtmlExporter';
 import { generateNonce, getDeviceId, sealEventOnDevice } from '../lib/taiService';
-import type {
-  OfflinePendingEvent,
-  SealStatus,
-  TaiPackage,
-  TraceEvent,
-  TraceEventType,
+import {
+  BLUEPRINT_LIMITS,
+  type OfflinePendingEvent,
+  type PilotConfig,
+  type SealStatus,
+  type TaiPackage,
+  type TraceEvent,
+  type TraceEventType,
 } from '../types/tai';
 import { QrCodeDisplay } from './QrCodeDisplay';
 
@@ -64,7 +70,10 @@ interface TransfersSectionProps {
     localTimestamp: string;
   }) => Promise<{ duplicateOrConflict: boolean; reason?: string }>;
   onEnqueueOfflineEvent: (item: OfflinePendingEvent) => void;
+  onImportOfflineBatch: (items: OfflinePendingEvent[]) => { added: number; skipped: number };
   onSyncOfflineQueue: () => Promise<void>;
+  operatorInfo: { uid: string; email: string; displayName: string } | null;
+  pilotConfig: PilotConfig | null;
   isAuthenticated: boolean;
   isBusy: boolean;
 }
@@ -180,10 +189,23 @@ export function TransfersSection({
   offlineQueue,
   onRecordOnlineTransfer,
   onEnqueueOfflineEvent,
+  onImportOfflineBatch,
   onSyncOfflineQueue,
+  operatorInfo,
+  pilotConfig,
   isAuthenticated,
   isBusy,
 }: TransfersSectionProps) {
+  // Offline HTML Station export state (passphrase never persisted)
+  const [vaultPassphrase, setVaultPassphrase] = useState('');
+  const [vaultPassphraseConfirm, setVaultPassphraseConfirm] = useState('');
+  const [exportingHtml, setExportingHtml] = useState(false);
+  const [htmlExportMsg, setHtmlExportMsg] = useState<{ kind: 'ok' | 'warn'; msg: string } | null>(
+    null
+  );
+  const [importBatchMsg, setImportBatchMsg] = useState<{ kind: 'ok' | 'warn'; msg: string } | null>(
+    null
+  );
   // Step 1: Receiver Device state
   const [eventType, setEventType] = useState<'dispatch' | 'receive' | 'return'>('receive');
   const [receiverName, setReceiverName] = useState('Módulo Mantenimiento Compresores');
@@ -513,6 +535,152 @@ export function TransfersSection({
       }
     } finally {
       setSealingLocal(false);
+    }
+  }
+
+  async function handleDownloadOfflineHtml(e: FormEvent) {
+    e.preventDefault();
+    if (!operatorInfo) {
+      setHtmlExportMsg({
+        kind: 'warn',
+        msg: 'Inicia sesión con tu cuenta de Google para emitir la credencial protegida en el HTML offline.',
+      });
+      return;
+    }
+    if (vaultPassphrase.trim().length < 8) {
+      setHtmlExportMsg({
+        kind: 'warn',
+        msg: 'La clave de protección offline debe tener al menos 8 caracteres.',
+      });
+      return;
+    }
+    if (vaultPassphrase !== vaultPassphraseConfirm) {
+      setHtmlExportMsg({
+        kind: 'warn',
+        msg: 'Las claves ingresadas no coinciden.',
+      });
+      return;
+    }
+
+    setExportingHtml(true);
+    setHtmlExportMsg(null);
+    try {
+      const { html, filename, expiresAt } = await generateProtectedOfflineHtml({
+        passphrase: vaultPassphrase,
+        user: operatorInfo,
+        deviceId: getDeviceId(),
+        packages,
+        events,
+        offlineQueue,
+        pilotConfig,
+      });
+
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      setVaultPassphrase('');
+      setVaultPassphraseConfirm('');
+      setHtmlExportMsg({
+        kind: 'ok',
+        msg: `Interfaz autónoma descargada (${filename}). Credencial cifrada vigente hasta ${new Date(expiresAt).toLocaleDateString()}.`,
+      });
+    } catch (err) {
+      setHtmlExportMsg({
+        kind: 'warn',
+        msg: err instanceof Error ? err.message : 'No se pudo generar el HTML offline.',
+      });
+    } finally {
+      setExportingHtml(false);
+    }
+  }
+
+  async function handleImportOfflineBatchFile(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportBatchMsg(null);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as { format?: string; events?: unknown[] };
+      if (!parsed || parsed.format !== 'tai-offline-batch-v1' || !Array.isArray(parsed.events)) {
+        setImportBatchMsg({
+          kind: 'warn',
+          msg: 'El archivo seleccionado no corresponde a un lote exportado desde la estación HTML offline.',
+        });
+        return;
+      }
+
+      const validItems: OfflinePendingEvent[] = [];
+      for (const rawItem of parsed.events) {
+        if (!rawItem || typeof rawItem !== 'object') continue;
+        const r = rawItem as Record<string, unknown>;
+        const evtType = String(r.eventType || '');
+        const seal = String(r.sealStatus || 'intact');
+        if (
+          typeof r.eventId !== 'string' ||
+          typeof r.packageId !== 'string' ||
+          typeof r.acceptanceNonce !== 'string' ||
+          typeof r.cvvCiphertext !== 'string' ||
+          typeof r.cvvIv !== 'string' ||
+          typeof r.cvvAuthTag !== 'string' ||
+          typeof r.csgSeal !== 'string' ||
+          !isValidTransferEventType(evtType)
+        ) {
+          continue;
+        }
+        validItems.push({
+          localId: String(r.localId || `IMP_${Date.now()}_${validItems.length}`).slice(0, 64),
+          eventId: r.eventId.slice(0, BLUEPRINT_LIMITS.EVENT_ID_MAX),
+          packageId: r.packageId.slice(0, BLUEPRINT_LIMITS.ID_MAX),
+          packageCode: String(r.packageCode || r.packageId).slice(0, BLUEPRINT_LIMITS.CODE_MAX),
+          eventType: evtType,
+          delivererName: String(r.delivererName || 'Operador offline').slice(0, BLUEPRINT_LIMITS.AREA_MAX),
+          receiverName: String(r.receiverName || 'Receptor offline').slice(0, BLUEPRINT_LIMITS.AREA_MAX),
+          zone: String(r.zone || 'Centro Logístico Buenos Aires').slice(0, BLUEPRINT_LIMITS.AREA_MAX),
+          functionRole: String(r.functionRole || 'Operador').slice(0, BLUEPRINT_LIMITS.AREA_MAX),
+          observations: String(r.observations || '').slice(0, BLUEPRINT_LIMITS.OBS_MAX),
+          acceptanceNonce: r.acceptanceNonce.slice(0, BLUEPRINT_LIMITS.NONCE_MAX),
+          offlineSequence: typeof r.offlineSequence === 'number' ? r.offlineSequence : 1,
+          deviceId: String(r.deviceId || 'DEV_OFFLINE_HTML').slice(0, 64),
+          localTimestamp: String(r.localTimestamp || new Date().toISOString()).slice(0, BLUEPRINT_LIMITS.TIMESTAMP_MAX),
+          sealStatus: seal === 'opened' || seal === 'damaged' ? seal : 'intact',
+          discrepancyNote: String(r.discrepancyNote || '').slice(0, BLUEPRINT_LIMITS.DISCREPANCY_MAX),
+          cvvCiphertext: r.cvvCiphertext.slice(0, BLUEPRINT_LIMITS.CIPHER_MAX),
+          cvvIv: r.cvvIv.slice(0, BLUEPRINT_LIMITS.SHORT_HEX_MAX),
+          cvvAuthTag: r.cvvAuthTag.slice(0, BLUEPRINT_LIMITS.SHORT_HEX_MAX),
+          csgSeal: r.csgSeal.slice(0, BLUEPRINT_LIMITS.CSG_MAX),
+        });
+      }
+
+      if (validItems.length === 0) {
+        setImportBatchMsg({
+          kind: 'warn',
+          msg: 'No se encontraron eventos CVV válidos dentro del archivo seleccionado.',
+        });
+        return;
+      }
+
+      const { added, skipped } = onImportOfflineBatch(validItems);
+      setImportBatchMsg({
+        kind: added > 0 ? 'ok' : 'warn',
+        msg:
+          added > 0
+            ? `Se importaron ${added} evento(s) CVV a la cola local${skipped > 0 ? ` (${skipped} ya existentes omitidos)` : ''}. Pulsa "Sincronizar ahora" con red activa.`
+            : `Todos los eventos del archivo (${skipped}) ya estaban en la cola local.`,
+      });
+    } catch {
+      setImportBatchMsg({
+        kind: 'warn',
+        msg: 'No se pudo leer el archivo JSON de lote offline.',
+      });
+    } finally {
+      e.target.value = '';
     }
   }
 
@@ -978,10 +1146,11 @@ export function TransfersSection({
           </div>
 
           {/* Right: Offline Queue + Package Event History */}
+          {/* Right: Offline Queue + Downloadable Offline HTML Station + Package Event History */}
           <div className="space-y-6 lg:col-span-5">
             {/* Step 3: Offline Queue & Manual/Auto Sync */}
             <div className="rounded-xl border border-slate-200 bg-white p-6">
-              <div className="flex items-center justify-between gap-3 border-b border-slate-100 pb-3">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
                 <div>
                   <h3 className="font-display text-sm font-semibold text-slate-900">
                     3. Cola offline del dispositivo ({offlineQueue.length})
@@ -990,16 +1159,39 @@ export function TransfersSection({
                     CVV ya generado localmente; pendiente de envío a la plataforma.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  disabled={isOffline || offlineQueue.length === 0 || isBusy || !isAuthenticated}
-                  onClick={onSyncOfflineQueue}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
-                >
-                  <CloudUpload className="h-3.5 w-3.5" />
-                  Sincronizar ahora
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap">
+                    <FileUp className="h-3.5 w-3.5" /> Importar lote (.json)
+                    <input
+                      type="file"
+                      accept="application/json,.json"
+                      onChange={handleImportOfflineBatchFile}
+                      className="hidden"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    disabled={isOffline || offlineQueue.length === 0 || isBusy || !isAuthenticated}
+                    onClick={onSyncOfflineQueue}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
+                  >
+                    <CloudUpload className="h-3.5 w-3.5" />
+                    Sincronizar ahora
+                  </button>
+                </div>
               </div>
+
+              {importBatchMsg && (
+                <p
+                  className={`mt-3 rounded-lg border px-3 py-2 text-xs font-medium ${
+                    importBatchMsg.kind === 'warn'
+                      ? 'border-amber-200 bg-amber-50 text-amber-900'
+                      : 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                  }`}
+                >
+                  {importBatchMsg.msg}
+                </p>
+              )}
 
               {offlineQueue.length === 0 ? (
                 <p className="mt-4 text-xs text-slate-500">
@@ -1031,6 +1223,77 @@ export function TransfersSection({
                   ))}
                 </ul>
               )}
+            </div>
+
+            {/* Downloadable Self-Contained Offline HTML Station */}
+            <div className="rounded-xl border border-slate-200 bg-white p-6">
+              <div className="flex items-start gap-2.5 border-b border-slate-100 pb-3">
+                <KeyRound className="mt-0.5 h-5 w-5 shrink-0 text-sky-700" />
+                <div>
+                  <h3 className="font-display text-sm font-semibold text-slate-900">
+                    Estación HTML descargable sin internet
+                  </h3>
+                  <p className="mt-0.5 text-[11px] text-slate-500">
+                    Descarga una interfaz autónoma con la UI de la plataforma, catálogo actual y bóveda cifrada (PBKDF2 + AES-256-GCM) que preserva tus credenciales protegidas para autenticar, validar y generar CVV offline.
+                  </p>
+                </div>
+              </div>
+
+              <form onSubmit={handleDownloadOfflineHtml} className="mt-4 space-y-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700">
+                      Clave de desbloqueo offline (mín. 8)
+                    </label>
+                    <input
+                      type="password"
+                      value={vaultPassphrase}
+                      onChange={(e) => setVaultPassphrase(e.target.value)}
+                      minLength={8}
+                      required
+                      placeholder="PIN / contraseña offline"
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700">
+                      Confirmar clave offline
+                    </label>
+                    <input
+                      type="password"
+                      value={vaultPassphraseConfirm}
+                      onChange={(e) => setVaultPassphraseConfirm(e.target.value)}
+                      minLength={8}
+                      required
+                      placeholder="Repite la clave"
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs"
+                    />
+                  </div>
+                </div>
+
+                {htmlExportMsg && (
+                  <p
+                    className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+                      htmlExportMsg.kind === 'warn'
+                        ? 'border-amber-200 bg-amber-50 text-amber-900'
+                        : 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                    }`}
+                  >
+                    {htmlExportMsg.msg}
+                  </p>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={!isAuthenticated || exportingHtml}
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-slate-300 bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-slate-800 disabled:opacity-50"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  {exportingHtml
+                    ? 'Cifrando credencial y empaquetando HTML...'
+                    : 'Descargar interfaz HTML offline protegida'}
+                </button>
+              </form>
             </div>
 
             {/* Package Event History */}

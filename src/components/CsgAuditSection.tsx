@@ -4,13 +4,17 @@ import {
   CheckCircle2,
   ExternalLink,
   FileSpreadsheet,
+  FolderOpen,
   Lock,
+  Paperclip,
   Plus,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  Trash2,
   Upload,
 } from 'lucide-react';
+import { openGooglePicker, type PickedDriveFile } from '../lib/googlePicker';
 import { verifyCvvLocally } from '../lib/localCrypto';
 import {
   appendRowsToSheet,
@@ -76,6 +80,8 @@ export function CsgAuditSection({
   const [selectedTab, setSelectedTab] = useState<string>('');
   const [sheetRows, setSheetRows] = useState<string[][]>([]);
   const [sheetBusy, setSheetBusy] = useState(false);
+  const [pickerBusy, setPickerBusy] = useState(false);
+  const [pickedDriveFiles, setPickedDriveFiles] = useState<PickedDriveFile[]>([]);
   const [sheetError, setSheetError] = useState('');
   const [sheetSuccess, setSheetSuccess] = useState('');
   const [pendingSync, setPendingSync] = useState<PendingSheetSync | null>(null);
@@ -157,14 +163,16 @@ export function CsgAuditSection({
     }
   }
 
-  async function handleConnectSpreadsheet() {
-    if (!accessToken || !sheetInput.trim()) return;
+  async function handleConnectSpreadsheet(explicitId?: string) {
+    const targetInput = (explicitId ?? sheetInput).trim();
+    if (!accessToken || !targetInput) return;
     setSheetBusy(true);
     setSheetError('');
     setSheetSuccess('');
     try {
-      const meta = await getSpreadsheetMetadata(accessToken, sheetInput);
+      const meta = await getSpreadsheetMetadata(accessToken, targetInput);
       setSheetMeta(meta);
+      setSheetInput(meta.spreadsheetId);
       const firstTab = meta.tabs[0]?.title || '';
       setSelectedTab(firstTab);
       await onSaveSheetConfig(meta.spreadsheetId, meta.title);
@@ -177,6 +185,61 @@ export function CsgAuditSection({
       setSheetError(err instanceof Error ? err.message : 'Error al conectar hoja');
     } finally {
       setSheetBusy(false);
+    }
+  }
+
+  async function handlePickSpreadsheetFromDrive() {
+    if (!accessToken) return;
+    setPickerBusy(true);
+    setSheetError('');
+    setSheetSuccess('');
+    try {
+      const picked = await openGooglePicker({ accessToken, mode: 'spreadsheets' });
+      if (picked.length > 0) {
+        await handleConnectSpreadsheet(picked[0].id);
+      }
+    } catch (err) {
+      setSheetError(
+        err instanceof Error
+          ? `${err.message} Si autorizaste la sesión antes de habilitar Drive, vuelve a iniciar sesión con Google.`
+          : 'No se pudo abrir Google Picker.'
+      );
+    } finally {
+      setPickerBusy(false);
+    }
+  }
+
+  async function handlePickEvidenceFilesFromDrive() {
+    if (!accessToken) return;
+    setPickerBusy(true);
+    setSheetError('');
+    setSheetSuccess('');
+    try {
+      const picked = await openGooglePicker({ accessToken, mode: 'docs' });
+      if (picked.length > 0) {
+        setPickedDriveFiles((prev) => {
+          const seen = new Set(prev.map((item) => item.id));
+          const merged = [...prev];
+          for (const file of picked) {
+            if (!seen.has(file.id)) {
+              seen.add(file.id);
+              merged.unshift(file);
+            }
+          }
+          return merged;
+        });
+        setSheetSuccess(
+          `Se seleccionaron ${picked.length} documento(s) desde Google Drive con Google Picker.`
+        );
+      }
+    } catch (err) {
+      setSheetError(
+        err instanceof Error
+          ? `${err.message} Si autorizaste la sesión antes de habilitar Drive, vuelve a iniciar sesión con Google.`
+          : 'No se pudo abrir Google Picker.'
+      );
+    } finally {
+      setPickerBusy(false);
     }
   }
 
@@ -446,44 +509,55 @@ export function CsgAuditSection({
         </div>
       </div>
 
-      {/* Row 2: Google Sheets Integration */}
+      {/* Row 2: Google Sheets & Google Picker (Drive) Integration */}
       <div className="rounded-xl border border-slate-200 bg-white p-6">
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 pb-4">
           <div className="flex items-start gap-3">
             <FileSpreadsheet className="mt-0.5 h-5 w-5 text-emerald-700" />
             <div>
               <h2 className="font-display text-base font-semibold text-slate-900">
-                Sincronización con Google Sheets (Bitácora Piloto)
+                Google Drive Picker y Sincronización con Google Sheets
               </h2>
               <p className="mt-1 text-xs text-slate-500">
-                Crea una hoja de cálculo de auditoría o vincula una existente para exportar paquetes y registros maestros.
+                Selecciona hojas de cálculo o documentos de respaldo en tu Google Drive con Google Picker, o crea una bitácora piloto nueva.
               </p>
             </div>
           </div>
 
-          {sheetMeta && (
-            <a
-              href={sheetMeta.spreadsheetUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-sky-700 hover:bg-slate-50"
-            >
-              Abrir en Google Sheets <ExternalLink className="h-3.5 w-3.5" />
-            </a>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {isAuthenticated && accessToken && (
+              <button
+                type="button"
+                onClick={onGoogleLogin}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              >
+                <RefreshCw className="h-3.5 w-3.5" /> Reautorizar Drive / Sheets
+              </button>
+            )}
+            {sheetMeta && (
+              <a
+                href={sheetMeta.spreadsheetUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-sky-700 hover:bg-slate-50"
+              >
+                Abrir en Google Sheets <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+            )}
+          </div>
         </div>
 
         {!isAuthenticated || !accessToken ? (
           <div className="mt-5 flex flex-wrap items-center justify-between gap-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
             <p className="text-xs text-slate-700">
-              Conecta tu cuenta de Google con permisos de Google Sheets para crear, leer y sincronizar bitácoras en tu Drive.
+              Conecta tu cuenta de Google con permisos de Google Drive y Google Sheets para usar Google Picker, seleccionar hojas y sincronizar bitácoras.
             </p>
             <button
               type="button"
               onClick={onGoogleLogin}
               className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap"
             >
-              Autorizar Google Sheets
+              Autorizar Google Drive y Sheets
             </button>
           </div>
         ) : (
@@ -503,7 +577,7 @@ export function CsgAuditSection({
                   />
                   <button
                     type="button"
-                    disabled={sheetBusy}
+                    disabled={sheetBusy || pickerBusy}
                     onClick={handleCreateSpreadsheet}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
                   >
@@ -512,29 +586,101 @@ export function CsgAuditSection({
                 </div>
               </div>
 
-              {/* Connect existing Sheet */}
+              {/* Connect existing Sheet via Google Picker or URL/ID */}
               <div className="rounded-lg border border-slate-200 p-4">
                 <p className="text-xs font-semibold text-slate-800">
-                  Conectar hoja de Google Sheets existente (URL o ID)
+                  Conectar hoja existente (Google Picker o URL / ID)
                 </p>
-                <div className="mt-2 flex gap-2">
+                <div className="mt-2 flex flex-wrap gap-2">
                   <input
                     type="text"
                     value={sheetInput}
                     onChange={(e) => setSheetInput(e.target.value)}
                     placeholder="https://docs.google.com/spreadsheets/d/... o ID"
-                    className="flex-1 rounded-lg border border-slate-200 px-3 py-1.5 font-mono text-xs"
+                    className="min-w-[180px] flex-1 rounded-lg border border-slate-200 px-3 py-1.5 font-mono text-xs"
                   />
                   <button
                     type="button"
-                    disabled={sheetBusy || !sheetInput.trim()}
-                    onClick={handleConnectSpreadsheet}
+                    disabled={sheetBusy || pickerBusy}
+                    onClick={handlePickSpreadsheetFromDrive}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-sky-700 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-sky-800 disabled:opacity-50 whitespace-nowrap"
+                  >
+                    <FolderOpen className="h-3.5 w-3.5" /> Elegir con Picker
+                  </button>
+                  <button
+                    type="button"
+                    disabled={sheetBusy || pickerBusy || !sheetInput.trim()}
+                    onClick={() => handleConnectSpreadsheet()}
                     className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
                   >
                     <RefreshCw className="h-3.5 w-3.5" /> Conectar
                   </button>
                 </div>
               </div>
+            </div>
+
+            {/* Google Picker for Supporting Drive Evidence Documents */}
+            <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <Paperclip className="mt-0.5 h-4 w-4 text-sky-700" />
+                  <div>
+                    <p className="text-xs font-semibold text-slate-900">
+                      Documentos y remitos en Google Drive (Google Picker)
+                    </p>
+                    <p className="text-[11px] text-slate-500">
+                      Adjunta o sube archivos de respaldo (remitos, especificaciones técnicas, fotos) desde tu Drive sin conceder acceso amplio a toda tu cuenta.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={pickerBusy || sheetBusy}
+                  onClick={handlePickEvidenceFilesFromDrive}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap"
+                >
+                  <FolderOpen className="h-3.5 w-3.5 text-sky-700" />
+                  {pickerBusy ? 'Abriendo Picker...' : 'Seleccionar archivos de Drive'}
+                </button>
+              </div>
+
+              {pickedDriveFiles.length > 0 && (
+                <ul className="mt-3 divide-y divide-slate-200 rounded-lg border border-slate-200 bg-white">
+                  {pickedDriveFiles.map((file) => (
+                    <li
+                      key={file.id}
+                      className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium text-slate-900">{file.name}</p>
+                        <p className="truncate font-mono text-[11px] text-slate-500">
+                          {file.mimeType} · ID: {file.id}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <a
+                          href={file.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-sky-700 hover:bg-slate-50"
+                        >
+                          Abrir <ExternalLink className="h-3 w-3" />
+                        </a>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPickedDriveFiles((prev) => prev.filter((item) => item.id !== file.id))
+                          }
+                          aria-label={`Quitar ${file.name}`}
+                          className="rounded-md p-1 text-slate-400 hover:bg-slate-100 hover:text-red-600"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
 
             {sheetError && (

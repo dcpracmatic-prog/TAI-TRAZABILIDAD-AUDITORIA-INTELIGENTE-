@@ -313,6 +313,32 @@ function TaiWorkspace() {
     writeOfflineQueue(user.uid, next);
   }
 
+  function handleImportOfflineBatch(items: OfflinePendingEvent[]): { added: number; skipped: number } {
+    if (!user) return { added: 0, skipped: items.length };
+    const existingIds = new Set(offlineQueue.map((q) => q.eventId));
+    const existingNonces = new Set(offlineQueue.map((q) => q.acceptanceNonce));
+    const toAdd: OfflinePendingEvent[] = [];
+    let skipped = 0;
+
+    for (const item of items) {
+      if (existingIds.has(item.eventId) || existingNonces.has(item.acceptanceNonce)) {
+        skipped += 1;
+        continue;
+      }
+      existingIds.add(item.eventId);
+      existingNonces.add(item.acceptanceNonce);
+      toAdd.push(item);
+    }
+
+    if (toAdd.length > 0) {
+      const next = [...offlineQueue, ...toAdd];
+      setOfflineQueue(next);
+      writeOfflineQueue(user.uid, next);
+      setStatusMessage(`Importados ${toAdd.length} evento(s) CVV desde estación HTML offline.`);
+    }
+    return { added: toAdd.length, skipped };
+  }
+
   const handleSyncOfflineQueue = useCallback(async () => {
     if (!user || effectiveOffline || offlineQueue.length === 0 || syncingRef.current) return;
     syncingRef.current = true;
@@ -577,7 +603,18 @@ function TaiWorkspace() {
             offlineQueue={offlineQueue}
             onRecordOnlineTransfer={handleRecordOnlineTransfer}
             onEnqueueOfflineEvent={handleEnqueueOfflineEvent}
+            onImportOfflineBatch={handleImportOfflineBatch}
             onSyncOfflineQueue={handleSyncOfflineQueue}
+            operatorInfo={
+              user
+                ? {
+                    uid: user.uid,
+                    email: user.email || 'operador@tai.local',
+                    displayName: user.displayName || user.email?.split('@')[0] || 'Operador TAI',
+                  }
+                : null
+            }
+            pilotConfig={pilotConfig}
             isAuthenticated={Boolean(user)}
             isBusy={isBusy}
           />

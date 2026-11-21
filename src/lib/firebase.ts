@@ -17,8 +17,16 @@ export const db = getFirestore(
 );
 export const auth = getAuth(app);
 
+export const WORKSPACE_SCOPES = [
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/drive.metadata.readonly',
+] as const;
+
 const provider = new GoogleAuthProvider();
-provider.addScope('https://www.googleapis.com/auth/spreadsheets');
+for (const scope of WORKSPACE_SCOPES) {
+  provider.addScope(scope);
+}
 provider.setCustomParameters({ prompt: 'select_account' });
 
 let isSigningIn = false;
