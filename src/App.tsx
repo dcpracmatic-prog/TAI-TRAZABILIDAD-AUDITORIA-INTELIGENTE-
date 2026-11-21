@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
 import { LogOut, Wifi, WifiOff } from 'lucide-react';
 import { CsgAuditSection } from './components/CsgAuditSection';
@@ -99,11 +99,29 @@ function TaiWorkspace() {
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [pilotConfig, setPilotConfig] = useState<PilotConfig | null>(null);
 
-  const [isOffline, setIsOffline] = useState(false);
+  const [simulatedOffline, setSimulatedOffline] = useState(false);
+  const [networkOnline, setNetworkOnline] = useState(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+  const [autoSyncOnReconnect, setAutoSyncOnReconnect] = useState(true);
   const [offlineQueue, setOfflineQueue] = useState<OfflinePendingEvent[]>([]);
   const [isBusy, setIsBusy] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [errorBanner, setErrorBanner] = useState('');
+
+  const effectiveOffline = simulatedOffline || !networkOnline;
+  const syncingRef = useRef(false);
+
+  useEffect(() => {
+    const onOnline = () => setNetworkOnline(true);
+    const onOffline = () => setNetworkOnline(false);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    return () => {
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
+    };
+  }, []);
 
   useEffect(() => {
     const unsub = initAuth((nextUser, token) => {
@@ -255,6 +273,14 @@ function TaiWorkspace() {
     acceptanceNonce: string;
     sealStatus: SealStatus;
     discrepancyNote: string;
+    preSealed: {
+      eventId: string;
+      ciphertext: string;
+      iv: string;
+      authTag: string;
+      csgSeal: string;
+    };
+    localTimestamp: string;
   }) {
     if (!user) return { duplicateOrConflict: false };
     setIsBusy(true);
@@ -273,7 +299,6 @@ function TaiWorkspace() {
         ownerEmail: user.email || 'operador@tai.local',
         capturedOffline: false,
         offlineSequence: 0,
-        localTimestamp: new Date().toISOString(),
         nextLifecycleStatus: nextLifecycle,
       });
     } finally {
@@ -288,16 +313,22 @@ function TaiWorkspace() {
     writeOfflineQueue(user.uid, next);
   }
 
-  async function handleSyncOfflineQueue() {
-    if (!user || isOffline || offlineQueue.length === 0) return;
+  const handleSyncOfflineQueue = useCallback(async () => {
+    if (!user || effectiveOffline || offlineQueue.length === 0 || syncingRef.current) return;
+    syncingRef.current = true;
     setIsBusy(true);
     setErrorBanner('');
     try {
       let synced = 0;
       let conflicts = 0;
+      const remaining: OfflinePendingEvent[] = [];
+
       for (const item of offlineQueue) {
         const pkg = packages.find((p) => p.id === item.packageId);
-        if (!pkg) continue;
+        if (!pkg) {
+          remaining.push(item);
+          continue;
+        }
         const nextLifecycle =
           item.eventType === 'return'
             ? 'return_open'
@@ -321,21 +352,36 @@ function TaiWorkspace() {
           sealStatus: item.sealStatus,
           discrepancyNote: item.discrepancyNote,
           nextLifecycleStatus: nextLifecycle,
+          preSealed: {
+            eventId: item.eventId,
+            ciphertext: item.cvvCiphertext,
+            iv: item.cvvIv,
+            authTag: item.cvvAuthTag,
+            csgSeal: item.csgSeal,
+          },
         });
         if (res.duplicateOrConflict) conflicts += 1;
         else synced += 1;
       }
-      setOfflineQueue([]);
-      writeOfflineQueue(user.uid, []);
+
+      setOfflineQueue(remaining);
+      writeOfflineQueue(user.uid, remaining);
       setStatusMessage(
-        `Sincronización offline completada: ${synced} evento(s) válidos, ${conflicts} conflicto(s) marcados para revisión.`
+        `Sincronización offline completada: ${synced} CVV enviados, ${conflicts} conflicto(s) marcados para revisión.`
       );
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : String(err));
     } finally {
+      syncingRef.current = false;
       setIsBusy(false);
     }
-  }
+  }, [user, effectiveOffline, offlineQueue, packages]);
+
+  useEffect(() => {
+    if (!effectiveOffline && autoSyncOnReconnect && user && offlineQueue.length > 0 && packages.length > 0) {
+      handleSyncOfflineQueue();
+    }
+  }, [effectiveOffline, autoSyncOnReconnect, user, offlineQueue.length, packages.length, handleSyncOfflineQueue]);
 
   async function handleLoadSample() {
     if (!user) return;
@@ -438,16 +484,16 @@ function TaiWorkspace() {
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setIsOffline((prev) => !prev)}
+              onClick={() => setSimulatedOffline((prev) => !prev)}
               className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-                isOffline
+                effectiveOffline
                   ? 'border-amber-300 bg-amber-50 text-amber-900'
                   : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
               }`}
             >
-              {isOffline ? (
+              {effectiveOffline ? (
                 <>
-                  <WifiOff className="h-3.5 w-3.5" /> Modo Offline activo
+                  <WifiOff className="h-3.5 w-3.5" /> {!networkOnline ? 'Sin red detectada' : 'Modo Offline activo'}
                 </>
               ) : (
                 <>
@@ -525,7 +571,9 @@ function TaiWorkspace() {
             selectedPackage={selectedPackage}
             onSelectPackage={setSelectedPackageId}
             events={events}
-            isOffline={isOffline}
+            isOffline={effectiveOffline}
+            autoSyncOnReconnect={autoSyncOnReconnect}
+            onToggleAutoSync={() => setAutoSyncOnReconnect((prev) => !prev)}
             offlineQueue={offlineQueue}
             onRecordOnlineTransfer={handleRecordOnlineTransfer}
             onEnqueueOfflineEvent={handleEnqueueOfflineEvent}

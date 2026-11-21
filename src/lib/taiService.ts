@@ -13,6 +13,7 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from './firebase';
+import { sealCvvLocally } from './localCrypto';
 import {
   type AuditAction,
   type AuditLog,
@@ -52,9 +53,22 @@ export function generateNonce(): string {
   return `NONCE_${Math.random().toString(36).slice(2, 10).toUpperCase()}_${Date.now().toString(36).toUpperCase()}`;
 }
 
-async function sealEventOnServer(params: {
+export function getDeviceId(): string {
+  const key = 'tai_device_id';
+  try {
+    const existing = window.localStorage.getItem(key);
+    if (existing) return existing;
+    const created = `DISP-BA-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    window.localStorage.setItem(key, created);
+    return created;
+  } catch {
+    return 'DISP-BA-LOCAL';
+  }
+}
+
+export async function sealEventOnDevice(params: {
   packageId: string;
-  eventId: string;
+  eventId?: string;
   eventType: TraceEventType;
   delivererName: string;
   receiverName: string;
@@ -63,22 +77,30 @@ async function sealEventOnServer(params: {
   acceptanceNonce: string;
   localTimestamp: string;
   observations: string;
-}): Promise<{
-  ciphertext: string;
-  iv: string;
-  authTag: string;
-  csgSeal: string;
-}> {
-  const res = await fetch('/api/crypto/seal', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
+  capturedOffline: boolean;
+}) {
+  const eventId = sanitizeId(
+    params.eventId || generateEventId('EVT'),
+    BLUEPRINT_LIMITS.EVENT_ID_MAX
+  );
+  const sealed = await sealCvvLocally({
+    packageId: params.packageId,
+    eventId,
+    eventType: params.eventType,
+    delivererName: params.delivererName,
+    receiverName: params.receiverName,
+    zone: params.zone,
+    functionRole: params.functionRole,
+    acceptanceNonce: params.acceptanceNonce,
+    localTimestamp: params.localTimestamp,
+    observations: params.observations,
+    capturedOffline: params.capturedOffline,
+    deviceId: getDeviceId(),
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || 'No se pudo emitir el sellado AES-256-GCM / CSG.');
-  }
-  return res.json();
+  return {
+    eventId,
+    ...sealed,
+  };
 }
 
 export function subscribeUserPackages(
@@ -230,7 +252,7 @@ export async function createPackageWithPackEvent(params: {
   // QR strictly contains only the record reference, zero secrets or full content
   const qrPayload = clampStr(`tai://pkg/${packageId}`, BLUEPRINT_LIMITS.QR_MAX);
 
-  const sealed = await sealEventOnServer({
+  const sealed = await sealEventOnDevice({
     packageId,
     eventId,
     eventType: 'pack',
@@ -241,6 +263,7 @@ export async function createPackageWithPackEvent(params: {
     acceptanceNonce: nonce,
     localTimestamp,
     observations: clampStr(params.observations, BLUEPRINT_LIMITS.OBS_MAX),
+    capturedOffline: false,
   });
 
   const pkgDoc = {
@@ -299,7 +322,7 @@ export async function createPackageWithPackEvent(params: {
     action: 'cvv_issued' as AuditAction,
     severity: (params.identificationStatus === 'uncertain_pending' ? 'warning' : 'info') as AuditSeverity,
     detail: clampStr(
-      `Embalaje TAI registrado (${pkgDoc.code}). Identificación: ${
+      `Embalaje TAI registrado (${pkgDoc.code}). CVV sellado en dispositivo. Identificación: ${
         params.identificationStatus === 'verified' ? 'Verificada' : 'Pendiente/Incierta'
       }.`,
       BLUEPRINT_LIMITS.OBS_MAX
@@ -337,6 +360,13 @@ export async function recordTransferEvent(params: {
   sealStatus: SealStatus;
   discrepancyNote: string;
   nextLifecycleStatus: LifecycleStatus;
+  preSealed?: {
+    eventId: string;
+    ciphertext: string;
+    iv: string;
+    authTag: string;
+    csgSeal: string;
+  };
 }): Promise<{ eventId: string; duplicateOrConflict: boolean; reason?: string }> {
   const eventsCol = collection(db, `packages/${params.pkg.id}/events`);
   const existingEventsSnap = await getDocs(
@@ -353,7 +383,7 @@ export async function recordTransferEvent(params: {
     const conflictEventId = sanitizeId(generateEventId('CONF'), BLUEPRINT_LIMITS.EVENT_ID_MAX);
     const logId = sanitizeId(generateEventId('LOG'), BLUEPRINT_LIMITS.EVENT_ID_MAX);
     const reason = `QR de aceptación duplicado (${params.acceptanceNonce}). Rechazado al sincronizar.`;
-    const sealed = await sealEventOnServer({
+    const sealed = await sealEventOnDevice({
       packageId: params.pkg.id,
       eventId: conflictEventId,
       eventType: 'conflict_detected',
@@ -364,6 +394,7 @@ export async function recordTransferEvent(params: {
       acceptanceNonce: `${params.acceptanceNonce}_DUP_${Date.now()}`,
       localTimestamp: params.localTimestamp,
       observations: reason,
+      capturedOffline: params.capturedOffline,
     });
 
     try {
@@ -413,7 +444,7 @@ export async function recordTransferEvent(params: {
     }
   }
 
-  // Rule 2: Incompatible offline sequence detection (e.g., offline event captured with sequence <= existing offline event)
+  // Rule 2: Incompatible offline sequence detection
   const hasIncompatibleOffline =
     params.capturedOffline &&
     existingEvents.some(
@@ -423,21 +454,23 @@ export async function recordTransferEvent(params: {
         ev.cvvState === 'valid'
     );
 
-  const eventId = sanitizeId(generateEventId('EVT'), BLUEPRINT_LIMITS.EVENT_ID_MAX);
-  const logId = sanitizeId(generateEventId('LOG'), BLUEPRINT_LIMITS.EVENT_ID_MAX);
+  const sealed = params.preSealed
+    ? params.preSealed
+    : await sealEventOnDevice({
+        packageId: params.pkg.id,
+        eventType: params.eventType,
+        delivererName: params.delivererName,
+        receiverName: params.receiverName,
+        zone: params.zone,
+        functionRole: params.functionRole,
+        acceptanceNonce: params.acceptanceNonce,
+        localTimestamp: params.localTimestamp,
+        observations: params.observations,
+        capturedOffline: params.capturedOffline,
+      });
 
-  const sealed = await sealEventOnServer({
-    packageId: params.pkg.id,
-    eventId,
-    eventType: params.eventType,
-    delivererName: params.delivererName,
-    receiverName: params.receiverName,
-    zone: params.zone,
-    functionRole: params.functionRole,
-    acceptanceNonce: params.acceptanceNonce,
-    localTimestamp: params.localTimestamp,
-    observations: params.observations,
-  });
+  const eventId = sanitizeId(sealed.eventId, BLUEPRINT_LIMITS.EVENT_ID_MAX);
+  const logId = sanitizeId(generateEventId('LOG'), BLUEPRINT_LIMITS.EVENT_ID_MAX);
 
   const finalCvvState = hasIncompatibleOffline ? 'conflict' : 'valid';
   const finalLifecycle: LifecycleStatus = hasIncompatibleOffline
@@ -496,7 +529,7 @@ export async function recordTransferEvent(params: {
       detail: clampStr(
         hasIncompatibleOffline
           ? `Conflicto offline detectado en ${params.pkg.code} (seq ${params.offlineSequence}).`
-          : `CVV emitido (${params.eventType}) para ${params.pkg.code}: ${params.delivererName} → ${params.receiverName}${params.capturedOffline ? ' [Sincronizado Offline]' : ''}.`,
+          : `CVV generado en dispositivo (${params.eventType}) para ${params.pkg.code}: ${params.delivererName} → ${params.receiverName}${params.capturedOffline ? ' [Sincronizado desde cola offline]' : ''}.`,
         BLUEPRINT_LIMITS.OBS_MAX
       ),
       actorEmail: clampStr(params.ownerEmail, BLUEPRINT_LIMITS.EMAIL_MAX),
@@ -626,7 +659,7 @@ export async function loadPilotBaselineScenario(ownerId: string, ownerEmail: str
     operatorName: 'M. Fernández (Embalaje)',
   });
 
-  const p2 = await createPackageWithPackEvent({
+  await createPackageWithPackEvent({
     ownerId,
     ownerEmail,
     code: 'TAI-BA-1043',
@@ -641,7 +674,6 @@ export async function loadPilotBaselineScenario(ownerId: string, ownerEmail: str
     operatorName: 'L. Gómez (Recepción)',
   });
 
-  // Add a real receive event on p1
   const snap = await getDoc(doc(db, 'packages', p1.packageId));
   if (snap.exists()) {
     const pkg1 = snap.data() as TaiPackage;
@@ -664,9 +696,6 @@ export async function loadPilotBaselineScenario(ownerId: string, ownerEmail: str
       nextLifecycleStatus: 'received',
     });
   }
-
-  // Keep p2 ready for material validation
-  void p2;
 }
 
 export function buildOfflineQueueStorageKey(userId: string): string {

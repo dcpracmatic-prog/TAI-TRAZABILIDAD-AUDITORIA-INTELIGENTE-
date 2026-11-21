@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   Upload,
 } from 'lucide-react';
+import { verifyCvvLocally } from '../lib/localCrypto';
 import {
   appendRowsToSheet,
   createTaiAuditSpreadsheet,
@@ -109,12 +110,20 @@ export function CsgAuditSection({
             acceptanceNonce: ev.acceptanceNonce,
           };
 
-      const res = await fetch('/api/crypto/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
+      let data = await verifyCvvLocally(payload);
+      if (!data.valid && !tamper) {
+        const res = await fetch('/api/crypto/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          const serverData = await res.json();
+          if (serverData.valid) {
+            data = serverData;
+          }
+        }
+      }
       setVerifyResult(data);
 
       if (tamper && !data.valid && selectedPackage && ev.cvvState !== 'invalidated_csg') {

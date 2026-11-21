@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import {
   AlertTriangle,
+  Camera,
   CheckCircle2,
   PackagePlus,
   Search,
@@ -8,6 +9,7 @@ import {
 } from 'lucide-react';
 import type { IdentificationStatus, TaiPackage } from '../types/tai';
 import { QrCodeDisplay } from './QrCodeDisplay';
+import { QrScannerModal } from './QrScannerModal';
 
 interface PackagingSectionProps {
   packages: TaiPackage[];
@@ -77,6 +79,8 @@ export function PackagingSection({
   const [confirmedDesc, setConfirmedDesc] = useState('');
   const [confirmedQty, setConfirmedQty] = useState('1');
   const [validationNote, setValidationNote] = useState('');
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const [scanNotice, setScanNotice] = useState('');
 
   const filtered = packages.filter((pkg) => {
     const matchesFilter =
@@ -327,6 +331,13 @@ export function PackagingSection({
                   className="rounded-lg border border-slate-200 py-1.5 pl-8 pr-3 text-xs text-slate-800 focus:border-sky-600 focus:outline-none"
                 />
               </div>
+              <button
+                type="button"
+                onClick={() => setScannerOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+              >
+                <Camera className="h-3.5 w-3.5 text-sky-700" /> Escanear QR
+              </button>
               <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-1">
                 {(['all', 'verified', 'uncertain_pending'] as const).map((tab) => (
                   <button
@@ -345,6 +356,12 @@ export function PackagingSection({
               </div>
             </div>
           </div>
+
+          {scanNotice && (
+            <p className="mt-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">
+              {scanNotice}
+            </p>
+          )}
 
           {filtered.length === 0 ? (
             <div className="py-10 text-center">
@@ -564,6 +581,28 @@ export function PackagingSection({
           </div>
         )}
       </div>
+
+      <QrScannerModal
+        open={scannerOpen}
+        title="Escanear QR de paquete TAI"
+        subtitle="Apunta la cámara al código QR de la cara exterior de la caja para abrir su registro."
+        placeholder="tai://pkg/PKG_BA_..."
+        onClose={() => setScannerOpen(false)}
+        onDetected={(raw) => {
+          setScannerOpen(false);
+          const cleaned = raw.replace(/^tai:\/\/pkg\//, '').trim();
+          const match = packages.find(
+            (p) => p.id === cleaned || p.code.toLowerCase() === cleaned.toLowerCase()
+          );
+          if (match) {
+            onSelectPackage(match.id);
+            setScanNotice(`QR reconocido: unidad ${match.code} seleccionada.`);
+          } else {
+            setSearchQuery(cleaned);
+            setScanNotice(`QR leído (${cleaned}). No se encontró coincidencia exacta en tu inventario.`);
+          }
+        }}
+      />
     </div>
   );
 }

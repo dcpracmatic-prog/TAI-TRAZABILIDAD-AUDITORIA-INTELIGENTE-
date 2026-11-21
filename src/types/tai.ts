@@ -121,6 +121,7 @@ export interface PilotConfig {
 
 export interface OfflinePendingEvent {
   localId: string;
+  eventId: string;
   packageId: string;
   packageCode: string;
   eventType: TraceEventType;
@@ -135,6 +136,10 @@ export interface OfflinePendingEvent {
   localTimestamp: string;
   sealStatus: SealStatus;
   discrepancyNote: string;
+  cvvCiphertext: string;
+  cvvIv: string;
+  cvvAuthTag: string;
+  csgSeal: string;
 }
 
 export interface GroundedPlace {
