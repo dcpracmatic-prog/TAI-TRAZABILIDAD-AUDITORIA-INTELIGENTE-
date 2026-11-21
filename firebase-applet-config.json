@@ -1,8 +1,9 @@
 {
   "projectId": "useful-cyclist-502606-u7",
   "appId": "1:196701704883:web:63db2c0b35ad00387756c6",
-  "apiKey": "",
+  "apiKey": "AIzaSyC_Np8W66y_fSGRClhKxhMXobB6SS3vWY4",
   "authDomain": "useful-cyclist-502606-u7.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-cab49ff7-b052-4597-ae03-3dd6978fc206",
   "storageBucket": "useful-cyclist-502606-u7.firebasestorage.app",
   "messagingSenderId": "196701704883",
   "measurementId": "",

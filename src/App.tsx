@@ -168,10 +168,15 @@ function TaiWorkspace() {
       setOfflineQueue(queue);
       setEventProofs(proofs);
       setTrustedStationKeys(stations);
-      if (snapshot && snapshot.packages.length > 0) {
-        setPackages((prev) => (prev.length > 0 ? prev : snapshot.packages));
-        setCachedKnownNonces(snapshot.knownNonces || []);
-        setSelectedPackageId((prev) => prev || snapshot.packages[0]?.id || null);
+      if (snapshot) {
+        if (snapshot.packages.length > 0) {
+          setPackages((prev) => (prev.length > 0 ? prev : snapshot.packages));
+          setCachedKnownNonces(snapshot.knownNonces || []);
+          setSelectedPackageId((prev) => prev || snapshot.packages[0]?.id || null);
+        }
+        if (snapshot.pilotConfig) {
+          setPilotConfig((prev) => prev ?? snapshot.pilotConfig ?? null);
+        }
       }
     })();
 
@@ -194,13 +199,15 @@ function TaiWorkspace() {
       (err) => setErrorBanner(err.message)
     );
 
-    loadPilotConfig(user.uid)
-      .then((cfg) => setPilotConfig(cfg))
-      .catch((err) => {
-        if (!effectiveOffline) {
+    if (!effectiveOffline) {
+      loadPilotConfig(user.uid)
+        .then((cfg) => {
+          if (cfg) setPilotConfig(cfg);
+        })
+        .catch((err) => {
           setErrorBanner(err instanceof Error ? err.message : String(err));
-        }
-      });
+        });
+    }
 
     return () => {
       cancelled = true;
@@ -210,7 +217,7 @@ function TaiWorkspace() {
   }, [user, effectiveOffline]);
 
   useEffect(() => {
-    if (!user || packages.length === 0) return;
+    if (!user || (packages.length === 0 && !pilotConfig)) return;
     const mergedNonces = Array.from(
       new Set([
         ...cachedKnownNonces,
@@ -220,9 +227,10 @@ function TaiWorkspace() {
     void writeEncryptedOfflineSnapshot(user.uid, {
       packages,
       knownNonces: mergedNonces,
+      pilotConfig,
       savedAt: new Date().toISOString(),
     });
-  }, [user, packages, events, cachedKnownNonces]);
+  }, [user, packages, events, cachedKnownNonces, pilotConfig]);
 
   useEffect(() => {
     if (!user || !selectedPackageId) {

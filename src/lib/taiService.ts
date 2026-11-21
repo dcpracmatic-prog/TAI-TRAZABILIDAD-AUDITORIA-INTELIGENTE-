@@ -203,6 +203,11 @@ export async function loadPilotConfig(userId: string): Promise<PilotConfig | nul
     const snap = await getDoc(doc(db, 'pilotConfigs', userId));
     return snap.exists() ? (snap.data() as PilotConfig) : null;
   } catch (error) {
+    const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    const code = (error as { code?: string })?.code;
+    if (msg.includes('client is offline') || code === 'unavailable') {
+      return null;
+    }
     handleFirestoreError(error, OperationType.GET, path);
   }
 }
@@ -794,6 +799,7 @@ export async function writeEncryptedOfflineQueue(
 export interface OfflineAppSnapshot {
   packages: TaiPackage[];
   knownNonces: string[];
+  pilotConfig?: PilotConfig | null;
   savedAt: string;
 }
 

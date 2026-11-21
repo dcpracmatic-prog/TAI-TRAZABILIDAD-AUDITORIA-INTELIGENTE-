@@ -57,6 +57,9 @@ let isSigningIn = false;
 let cachedAccessToken: string | null = null;
 
 export async function testConnection(): Promise<void> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return;
+  }
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
