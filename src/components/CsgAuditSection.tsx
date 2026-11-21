@@ -15,7 +15,9 @@ import {
   Upload,
 } from 'lucide-react';
 import { openGooglePicker, type PickedDriveFile } from '../lib/googlePicker';
-import { verifyCvvLocally } from '../lib/localCrypto';
+import { getDeviceSigningIdentity, verifyCvvLocally } from '../lib/localCrypto';
+import { ACTIVE_CSG_PROVIDER, verifyCrossStationEventProof } from '../lib/offlineCrypto';
+import { getDeviceId } from '../lib/taiService';
 import {
   appendRowsToSheet,
   createTaiAuditSpreadsheet,
@@ -23,7 +25,13 @@ import {
   readSheetRange,
   type SpreadsheetMetadata,
 } from '../lib/sheets';
-import type { AuditLog, PilotConfig, TaiPackage, TraceEvent } from '../types/tai';
+import type {
+  AuditLog,
+  CrossStationEventProof,
+  PilotConfig,
+  TaiPackage,
+  TraceEvent,
+} from '../types/tai';
 import { ConfirmModal } from './ConfirmModal';
 
 interface CsgAuditSectionProps {
@@ -31,6 +39,8 @@ interface CsgAuditSectionProps {
   selectedPackage: TaiPackage | null;
   events: TraceEvent[];
   auditLogs: AuditLog[];
+  eventProofs?: Record<string, CrossStationEventProof>;
+  trustedStationKeys?: string[];
   pilotConfig: PilotConfig | null;
   accessToken: string | null;
   isAuthenticated: boolean;
@@ -51,6 +61,8 @@ export function CsgAuditSection({
   selectedPackage,
   events,
   auditLogs,
+  eventProofs,
+  trustedStationKeys,
   pilotConfig,
   accessToken,
   isAuthenticated,
@@ -116,7 +128,61 @@ export function CsgAuditSection({
             acceptanceNonce: ev.acceptanceNonce,
           };
 
-      let data = await verifyCvvLocally(payload);
+      let data: {
+        valid: boolean;
+        csgStatus: string;
+        reason: string;
+        decryptedPayload?: Record<string, unknown>;
+      } = await verifyCvvLocally(payload);
+
+      const proof = eventProofs?.[ev.id];
+      if (!data.valid && proof) {
+        const deviceIdentity = await getDeviceSigningIdentity();
+        const crossRes = await verifyCrossStationEventProof(
+          {
+            eventId: ev.id,
+            packageId: ev.packageId,
+            eventType: ev.eventType,
+            acceptanceNonce: ev.acceptanceNonce,
+            receiverName: ev.receiverName,
+            zone: ev.zone,
+            localTimestamp: ev.localTimestamp,
+            deviceId: proof.deviceId || proof.stationCert?.deviceId || getDeviceId(),
+            cvvCiphertext: payload.ciphertext,
+            cvvIv: payload.iv,
+            cvvAuthTag: payload.authTag,
+          },
+          proof,
+          {
+            trustedIssuerKeyIds: [deviceIdentity.keyId],
+            trustedStationKeyIds: trustedStationKeys || [],
+            requireStationCert: false,
+          }
+        );
+
+        if (crossRes.valid) {
+          data = {
+            valid: true,
+            csgStatus: 'VERIFIED',
+            reason: crossRes.reason,
+            decryptedPayload: {
+              verificationMode: 'Prueba asimétrica entre estaciones (ECDSA P-256)',
+              stationKeyId: proof.stationKeyId,
+              receiverKeyId: proof.acceptanceProof?.receiverKeyId ?? '',
+              receiverUid: proof.acceptanceProof?.receiverUid ?? '',
+              operatorUid: proof.operatorUid,
+              csgProvider: ACTIVE_CSG_PROVIDER.providerId,
+            },
+          };
+        } else if (tamper) {
+          data = {
+            valid: false,
+            csgStatus: 'INVALIDATED_TAMPERED',
+            reason: crossRes.reason,
+          };
+        }
+      }
+
       if (!data.valid && !tamper) {
         const res = await fetch('/api/crypto/verify', {
           method: 'POST',
@@ -390,6 +456,9 @@ export function CsgAuditSection({
               {activeEvent && (
                 <>
                   <div className="space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-700">
+                    <p className="font-sans text-[11px] text-slate-600">
+                      Motor activo: <span className="font-semibold text-slate-800">{ACTIVE_CSG_PROVIDER.displayName}</span>
+                    </p>
                     <p className="truncate">
                       <span className="font-semibold text-slate-900">IV:</span> {activeEvent.cvvIv}
                     </p>
@@ -405,6 +474,13 @@ export function CsgAuditSection({
                       <span className="font-semibold text-slate-900">Ciphertext:</span>{' '}
                       {activeEvent.cvvCiphertext}
                     </p>
+                    {eventProofs?.[activeEvent.id] && (
+                      <p className="truncate text-emerald-800">
+                        <span className="font-semibold">Firma Estación/Receptor:</span>{' '}
+                        #{eventProofs[activeEvent.id].stationKeyId} · Receptor #
+                        {eventProofs[activeEvent.id].acceptanceProof?.receiverKeyId ?? 'N/A'}
+                      </p>
+                    )}
                   </div>
 
                   <div className="flex flex-wrap gap-2">

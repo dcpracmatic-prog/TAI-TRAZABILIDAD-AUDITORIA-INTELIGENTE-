@@ -27,10 +27,18 @@ import {
   Smartphone,
   WifiOff,
 } from 'lucide-react';
+import { getDeviceSigningIdentity } from '../lib/localCrypto';
+import {
+  parseAndVerifyAcceptanceQr,
+  signAcceptanceQrPayload,
+  signCrossStationEvent,
+} from '../lib/offlineCrypto';
 import { generateProtectedOfflineHtml } from '../lib/offlineHtmlExporter';
+import { verifyImportedOfflineBatch, type ImportedBatchPayload } from '../lib/offlineSyncEngine';
 import { generateNonce, getDeviceId, sealEventOnDevice } from '../lib/taiService';
 import {
-  BLUEPRINT_LIMITS,
+  type AcceptanceProof,
+  type CrossStationEventProof,
   type OfflinePendingEvent,
   type PilotConfig,
   type SealStatus,
@@ -45,6 +53,10 @@ interface TransfersSectionProps {
   selectedPackage: TaiPackage | null;
   onSelectPackage: (id: string) => void;
   events: TraceEvent[];
+  cachedKnownNonces: string[];
+  trustedStationKeys: string[];
+  onRegisterTrustedStation: (stationKeyId: string) => Promise<void>;
+  onSaveEventProof: (eventId: string, proof: CrossStationEventProof) => void;
   isOffline: boolean;
   autoSyncOnReconnect: boolean;
   onToggleAutoSync: () => void;
@@ -67,6 +79,13 @@ interface TransfersSectionProps {
       authTag: string;
       csgSeal: string;
     };
+    receiverSignatureMeta?: {
+      receiverUid: string;
+      receiverKeyId: string;
+      receiverSignature: string;
+      acceptanceHash: string;
+      acceptanceCryptoId: string;
+    };
     localTimestamp: string;
   }) => Promise<{ duplicateOrConflict: boolean; reason?: string }>;
   onEnqueueOfflineEvent: (item: OfflinePendingEvent) => void;
@@ -88,64 +107,21 @@ const EVENT_LABELS: Record<TraceEventType, string> = {
   conflict_detected: 'Conflicto detectado',
 };
 
-interface ParsedAcceptanceQr {
+interface ValidatedAcceptanceQr {
   packageId: string;
+  packageCode: string;
   eventType: 'dispatch' | 'receive' | 'return';
   nonce: string;
+  acceptanceHash: string;
+  acceptanceCryptoId: string;
   receiverName: string;
   zone: string;
-}
-
-interface ValidatedAcceptanceQr extends ParsedAcceptanceQr {
-  packageCode: string;
+  receiverUid: string;
+  receiverDeviceId: string;
+  proof?: AcceptanceProof;
   capturedAt: string;
   isDuplicateNonce: boolean;
   duplicateReason?: string;
-}
-
-function isValidTransferEventType(value: string): value is 'dispatch' | 'receive' | 'return' {
-  return value === 'dispatch' || value === 'receive' || value === 'return';
-}
-
-function parseAcceptanceQr(raw: string): ParsedAcceptanceQr | null {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('tai://accept|')) {
-    const parts = trimmed.split('|');
-    if (parts.length >= 4) {
-      const packageId = parts[1]?.trim();
-      const evt = parts[2]?.trim();
-      const nonce = parts[3]?.trim();
-      if (!packageId || !evt || !isValidTransferEventType(evt) || !nonce || nonce.length < 4) {
-        return null;
-      }
-      return {
-        packageId,
-        eventType: evt,
-        nonce,
-        receiverName: parts[4]?.trim() || 'Receptor en sitio',
-        zone: parts[5]?.trim() || 'Centro Logístico Buenos Aires',
-      };
-    }
-  }
-  if (trimmed.startsWith('tai://accept/')) {
-    const rest = trimmed.replace('tai://accept/', '').split('/');
-    if (rest.length >= 3) {
-      const packageId = rest[0]?.trim();
-      const evt = rest[1]?.trim();
-      const nonce = rest[2]?.trim();
-      if (!packageId || !evt || !isValidTransferEventType(evt) || !nonce || nonce.length < 4) {
-        return null;
-      }
-      return {
-        packageId,
-        eventType: evt,
-        nonce,
-        receiverName: 'Receptor en sitio',
-        zone: 'Centro Logístico Buenos Aires',
-      };
-    }
-  }
-  return null;
 }
 
 async function decodeQrFromImageFile(file: File): Promise<string | null> {
@@ -183,6 +159,10 @@ export function TransfersSection({
   selectedPackage,
   onSelectPackage,
   events,
+  cachedKnownNonces,
+  trustedStationKeys,
+  onRegisterTrustedStation,
+  onSaveEventProof,
   isOffline,
   autoSyncOnReconnect,
   onToggleAutoSync,
@@ -211,6 +191,10 @@ export function TransfersSection({
   const [receiverName, setReceiverName] = useState('Módulo Mantenimiento Compresores');
   const [zone, setZone] = useState('Zona Operativa Sur · Dock Sud');
   const [acceptanceNonce, setAcceptanceNonce] = useState(() => generateNonce());
+  const [acceptanceQrValue, setAcceptanceQrValue] = useState('');
+  const [acceptanceKeyId, setAcceptanceKeyId] = useState('');
+  const [acceptanceHash, setAcceptanceHash] = useState('');
+  const [acceptanceCryptoId, setAcceptanceCryptoId] = useState('');
   const [receiverLocalSaved, setReceiverLocalSaved] = useState<string[]>([]);
 
   // Step 2: Deliverer Device camera scanner via react-qr-scanner
@@ -234,14 +218,55 @@ export function TransfersSection({
     iv: string;
     authTag: string;
     csgSeal: string;
+    stationKeyId?: string;
+    receiverKeyId?: string;
+    acceptanceCryptoId?: string;
     capturedOffline: boolean;
   } | null>(null);
   const [sealingLocal, setSealingLocal] = useState(false);
   const [feedback, setFeedback] = useState<{ kind: 'ok' | 'warn'; msg: string } | null>(null);
 
-  const acceptanceQrValue = selectedPackage
-    ? `tai://accept|${selectedPackage.id}|${eventType}|${acceptanceNonce}|${receiverName.trim()}|${zone.trim()}`
-    : '';
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedPackage) {
+      setAcceptanceQrValue('');
+      setAcceptanceHash('');
+      setAcceptanceCryptoId('');
+      return;
+    }
+    void (async () => {
+      try {
+        const signer = await getDeviceSigningIdentity();
+        const signed = await signAcceptanceQrPayload(
+          {
+            packageId: selectedPackage.id,
+            eventType,
+            nonce: acceptanceNonce,
+            receiverName: receiverName.trim() || 'Receptor en sitio',
+            zone: zone.trim() || 'Centro Logístico Buenos Aires',
+            receiverUid: operatorInfo?.uid || 'LOCAL_RECEIVER',
+            receiverDeviceId: getDeviceId(),
+          },
+          signer
+        );
+        if (!cancelled) {
+          setAcceptanceQrValue(signed.qrString);
+          setAcceptanceKeyId(signer.keyId);
+          setAcceptanceHash(signed.acceptanceHash);
+          setAcceptanceCryptoId(signed.acceptanceCryptoId);
+        }
+      } catch {
+        if (!cancelled) {
+          setAcceptanceQrValue('');
+          setAcceptanceHash('');
+          setAcceptanceCryptoId('');
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedPackage, eventType, acceptanceNonce, receiverName, zone, operatorInfo?.uid]);
 
   const cameraConstraints = useMemo<MediaStreamConstraints>(
     () => ({
@@ -266,19 +291,20 @@ export function TransfersSection({
   }, [stopCameraScanner]);
 
   const validateAndApplyAcceptanceQr = useCallback(
-    (raw: string, suppressTransientInvalid = false): boolean => {
-      const parsed = parseAcceptanceQr(raw);
-      if (!parsed) {
+    async (raw: string, suppressTransientInvalid = false): Promise<boolean> => {
+      const verified = await parseAndVerifyAcceptanceQr(raw);
+      if (!verified.valid || !verified.parsed) {
         if (!suppressTransientInvalid || Date.now() - lastInvalidWarnRef.current > 2000) {
           lastInvalidWarnRef.current = Date.now();
           setFeedback({
             kind: 'warn',
-            msg: `El código escaneado (${raw.slice(0, 60)}) no corresponde a un QR de aceptación TAI válido (tai://accept|...).`,
+            msg: verified.reason,
           });
         }
         return false;
       }
 
+      const parsed = verified.parsed;
       const targetPkg = packages.find(
         (p) => p.id === parsed.packageId || p.code === parsed.packageId
       );
@@ -293,9 +319,9 @@ export function TransfersSection({
       const duplicateInOffline = offlineQueue.some(
         (item) => item.acceptanceNonce === parsed.nonce
       );
-      const duplicateInSynced = events.some(
-        (ev) => ev.acceptanceNonce === parsed.nonce && ev.cvvState === 'valid'
-      );
+      const duplicateInSynced =
+        events.some((ev) => ev.acceptanceNonce === parsed.nonce && ev.cvvState === 'valid') ||
+        cachedKnownNonces.includes(parsed.nonce);
 
       const isDuplicateNonce = duplicateInOffline || duplicateInSynced;
       const duplicateReason = duplicateInOffline
@@ -306,9 +332,17 @@ export function TransfersSection({
 
       onSelectPackage(targetPkg.id);
       setScannedAcceptance({
-        ...parsed,
         packageId: targetPkg.id,
         packageCode: targetPkg.code,
+        eventType: parsed.eventType,
+        nonce: parsed.nonce,
+        acceptanceHash: parsed.acceptanceHash,
+        acceptanceCryptoId: parsed.acceptanceCryptoId,
+        receiverName: parsed.receiverName,
+        zone: parsed.zone,
+        receiverUid: parsed.receiverUid,
+        receiverDeviceId: parsed.receiverDeviceId,
+        proof: parsed.proof,
         capturedAt: new Date().toISOString(),
         isDuplicateNonce,
         duplicateReason,
@@ -321,11 +355,11 @@ export function TransfersSection({
         kind: isDuplicateNonce ? 'warn' : 'ok',
         msg: isDuplicateNonce
           ? `QR capturado (${parsed.nonce}) con advertencia: ${duplicateReason}`
-          : `QR de aceptación validado como inicio de ${EVENT_LABELS[parsed.eventType]} para ${targetPkg.code}. Ya puedes generar el CVV en dispositivo.`,
+          : `${verified.reason} · ${EVENT_LABELS[parsed.eventType]} para ${targetPkg.code}. Ya puedes generar el CVV.`,
       });
       return true;
     },
-    [packages, offlineQueue, events, onSelectPackage]
+    [packages, offlineQueue, events, cachedKnownNonces, onSelectPackage]
   );
 
   const handleCameraLoad = useCallback(() => {
@@ -363,12 +397,15 @@ export function TransfersSection({
       const rawText = typeof result === 'string' ? result : result.text || '';
       if (!rawText.trim()) return;
 
-      const accepted = validateAndApplyAcceptanceQr(rawText, true);
-      if (accepted) {
-        scanLockRef.current = true;
-        setCameraActive(false);
-        setCameraLoading(false);
-      }
+      scanLockRef.current = true;
+      void validateAndApplyAcceptanceQr(rawText, true).then((accepted) => {
+        if (accepted) {
+          setCameraActive(false);
+          setCameraLoading(false);
+        } else {
+          scanLockRef.current = false;
+        }
+      });
     },
     [validateAndApplyAcceptanceQr]
   );
@@ -392,7 +429,7 @@ export function TransfersSection({
         setCameraError('No se encontró ningún QR de aceptación válido en la imagen.');
         return;
       }
-      validateAndApplyAcceptanceQr(decodedText);
+      await validateAndApplyAcceptanceQr(decodedText);
     } catch {
       setCameraError('No se pudo procesar la imagen seleccionada.');
     } finally {
@@ -405,12 +442,12 @@ export function TransfersSection({
     const nextNonce = generateNonce();
     setAcceptanceNonce(nextNonce);
     setReceiverLocalSaved((prev) => [
-      `${selectedPackage.code} · ${EVENT_LABELS[eventType]} · ${nextNonce} (${new Date().toLocaleTimeString()})`,
+      `${selectedPackage.code} · ${EVENT_LABELS[eventType]} · ${acceptanceCryptoId || nextNonce} (${new Date().toLocaleTimeString()})`,
       ...prev.slice(0, 4),
     ]);
     setFeedback({
       kind: 'ok',
-      msg: `QR de aceptación generado en el teléfono del receptor (${isOffline ? 'sin red, registrado localmente' : 'listo para escaneo'}).`,
+      msg: `QR de aceptación con nonce + hash generado en el teléfono del receptor (${isOffline ? 'sin red, registrado localmente' : 'listo para escaneo'}).`,
     });
   }
 
@@ -443,7 +480,19 @@ export function TransfersSection({
       const activeNonce = scannedAcceptance.nonce;
       const activeEventType = scannedAcceptance.eventType;
 
-      // ALWAYS generate CVV locally on the deliverer's device using Web Crypto API (AES-256-GCM + CSG)
+      const deviceId = getDeviceId();
+      const receiverSignatureMeta =
+        scannedAcceptance.proof
+          ? {
+              receiverUid: scannedAcceptance.receiverUid,
+              receiverKeyId: scannedAcceptance.proof.receiverKeyId,
+              receiverSignature: scannedAcceptance.proof.signatureB64u,
+              acceptanceHash: scannedAcceptance.acceptanceHash,
+              acceptanceCryptoId: scannedAcceptance.acceptanceCryptoId,
+            }
+          : undefined;
+
+      // ALWAYS generate CVV locally on the deliverer's device using Web Crypto API (AES-256-GCM + HMAC + ECDSA)
       const sealed = await sealEventOnDevice({
         packageId: targetPkg.id,
         eventType: activeEventType,
@@ -455,13 +504,37 @@ export function TransfersSection({
         acceptanceNonce: activeNonce,
         localTimestamp,
         capturedOffline: isOffline,
+        receiverSignatureMeta,
       });
+
+      const deviceIdentity = await getDeviceSigningIdentity();
+      const eventProof = await signCrossStationEvent(
+        {
+          packageId: targetPkg.id,
+          eventId: sealed.eventId,
+          eventType: activeEventType,
+          acceptanceNonce: activeNonce,
+          cvvCiphertext: sealed.ciphertext,
+          cvvIv: sealed.iv,
+          cvvAuthTag: sealed.authTag,
+          localTimestamp,
+          deviceId,
+          operatorUid: operatorInfo?.uid || 'LOCAL_OPERATOR',
+          operatorEmail: operatorInfo?.email || '',
+          acceptanceProof: scannedAcceptance.proof,
+        },
+        deviceIdentity
+      );
+      onSaveEventProof(sealed.eventId, eventProof);
 
       setLastLocalCvv({
         eventId: sealed.eventId,
         iv: sealed.iv,
         authTag: sealed.authTag,
         csgSeal: sealed.csgSeal,
+        stationKeyId: deviceIdentity.keyId,
+        receiverKeyId: receiverSignatureMeta?.receiverKeyId,
+        acceptanceCryptoId: scannedAcceptance.acceptanceCryptoId,
         capturedOffline: isOffline,
       });
 
@@ -481,7 +554,7 @@ export function TransfersSection({
           observations: observations.trim(),
           acceptanceNonce: activeNonce,
           offlineSequence: nextSeq,
-          deviceId: getDeviceId(),
+          deviceId,
           localTimestamp,
           sealStatus,
           discrepancyNote: discrepancyNote.trim(),
@@ -489,10 +562,17 @@ export function TransfersSection({
           cvvIv: sealed.iv,
           cvvAuthTag: sealed.authTag,
           csgSeal: sealed.csgSeal,
+          acceptanceHash: receiverSignatureMeta?.acceptanceHash || scannedAcceptance.acceptanceHash,
+          acceptanceCryptoId:
+            receiverSignatureMeta?.acceptanceCryptoId || scannedAcceptance.acceptanceCryptoId,
+          receiverUid: receiverSignatureMeta?.receiverUid || scannedAcceptance.receiverUid,
+          receiverKeyId: receiverSignatureMeta?.receiverKeyId,
+          receiverSignature: receiverSignatureMeta?.receiverSignature,
+          proof: eventProof,
         });
         setFeedback({
           kind: 'ok',
-          msg: `CVV ${sealed.eventId} generado localmente sin red y guardado en cola offline (secuencia #${nextSeq}).`,
+          msg: `CVV ${sealed.eventId} generado localmente sin red con firma del receptor (${receiverSignatureMeta?.receiverKeyId ? `#${receiverSignatureMeta.receiverKeyId}` : 'simulado'}) y estación #${deviceIdentity.keyId} (secuencia #${nextSeq}).`,
         });
         setScannedAcceptance(null);
         setAcceptanceNonce(generateNonce());
@@ -517,6 +597,7 @@ export function TransfersSection({
           authTag: sealed.authTag,
           csgSeal: sealed.csgSeal,
         },
+        receiverSignatureMeta,
         localTimestamp,
       });
 
@@ -528,7 +609,7 @@ export function TransfersSection({
       } else {
         setFeedback({
           kind: 'ok',
-          msg: `CVV ${sealed.eventId} generado en dispositivo y sincronizado con la plataforma.`,
+          msg: `CVV ${sealed.eventId} generado en dispositivo (#${deviceIdentity.keyId}) con firma del receptor (${receiverSignatureMeta?.receiverKeyId ? `#${receiverSignatureMeta.receiverKeyId}` : 'local'}) y sincronizado con la plataforma.`,
         });
         setScannedAcceptance(null);
         setAcceptanceNonce(generateNonce());
@@ -565,7 +646,7 @@ export function TransfersSection({
     setExportingHtml(true);
     setHtmlExportMsg(null);
     try {
-      const { html, filename, expiresAt } = await generateProtectedOfflineHtml({
+      const { html, filename, expiresAt, stationIdentity } = await generateProtectedOfflineHtml({
         passphrase: vaultPassphrase,
         user: operatorInfo,
         deviceId: getDeviceId(),
@@ -574,6 +655,7 @@ export function TransfersSection({
         offlineQueue,
         pilotConfig,
       });
+      await onRegisterTrustedStation(stationIdentity.keyId);
 
       const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
       const url = URL.createObjectURL(blob);
@@ -589,7 +671,7 @@ export function TransfersSection({
       setVaultPassphraseConfirm('');
       setHtmlExportMsg({
         kind: 'ok',
-        msg: `Interfaz autónoma descargada (${filename}). Credencial cifrada vigente hasta ${new Date(expiresAt).toLocaleDateString()}.`,
+        msg: `Interfaz autónoma descargada (${filename}). Estación certificada #${stationIdentity.keyId} vigente hasta ${new Date(expiresAt).toLocaleDateString()}.`,
       });
     } catch (err) {
       setHtmlExportMsg({
@@ -607,7 +689,7 @@ export function TransfersSection({
     setImportBatchMsg(null);
     try {
       const text = await file.text();
-      const parsed = JSON.parse(text) as { format?: string; events?: unknown[] };
+      const parsed = JSON.parse(text) as ImportedBatchPayload;
       if (!parsed || parsed.format !== 'tai-offline-batch-v1' || !Array.isArray(parsed.events)) {
         setImportBatchMsg({
           kind: 'warn',
@@ -616,63 +698,29 @@ export function TransfersSection({
         return;
       }
 
-      const validItems: OfflinePendingEvent[] = [];
-      for (const rawItem of parsed.events) {
-        if (!rawItem || typeof rawItem !== 'object') continue;
-        const r = rawItem as Record<string, unknown>;
-        const evtType = String(r.eventType || '');
-        const seal = String(r.sealStatus || 'intact');
-        if (
-          typeof r.eventId !== 'string' ||
-          typeof r.packageId !== 'string' ||
-          typeof r.acceptanceNonce !== 'string' ||
-          typeof r.cvvCiphertext !== 'string' ||
-          typeof r.cvvIv !== 'string' ||
-          typeof r.cvvAuthTag !== 'string' ||
-          typeof r.csgSeal !== 'string' ||
-          !isValidTransferEventType(evtType)
-        ) {
-          continue;
-        }
-        validItems.push({
-          localId: String(r.localId || `IMP_${Date.now()}_${validItems.length}`).slice(0, 64),
-          eventId: r.eventId.slice(0, BLUEPRINT_LIMITS.EVENT_ID_MAX),
-          packageId: r.packageId.slice(0, BLUEPRINT_LIMITS.ID_MAX),
-          packageCode: String(r.packageCode || r.packageId).slice(0, BLUEPRINT_LIMITS.CODE_MAX),
-          eventType: evtType,
-          delivererName: String(r.delivererName || 'Operador offline').slice(0, BLUEPRINT_LIMITS.AREA_MAX),
-          receiverName: String(r.receiverName || 'Receptor offline').slice(0, BLUEPRINT_LIMITS.AREA_MAX),
-          zone: String(r.zone || 'Centro Logístico Buenos Aires').slice(0, BLUEPRINT_LIMITS.AREA_MAX),
-          functionRole: String(r.functionRole || 'Operador').slice(0, BLUEPRINT_LIMITS.AREA_MAX),
-          observations: String(r.observations || '').slice(0, BLUEPRINT_LIMITS.OBS_MAX),
-          acceptanceNonce: r.acceptanceNonce.slice(0, BLUEPRINT_LIMITS.NONCE_MAX),
-          offlineSequence: typeof r.offlineSequence === 'number' ? r.offlineSequence : 1,
-          deviceId: String(r.deviceId || 'DEV_OFFLINE_HTML').slice(0, 64),
-          localTimestamp: String(r.localTimestamp || new Date().toISOString()).slice(0, BLUEPRINT_LIMITS.TIMESTAMP_MAX),
-          sealStatus: seal === 'opened' || seal === 'damaged' ? seal : 'intact',
-          discrepancyNote: String(r.discrepancyNote || '').slice(0, BLUEPRINT_LIMITS.DISCREPANCY_MAX),
-          cvvCiphertext: r.cvvCiphertext.slice(0, BLUEPRINT_LIMITS.CIPHER_MAX),
-          cvvIv: r.cvvIv.slice(0, BLUEPRINT_LIMITS.SHORT_HEX_MAX),
-          cvvAuthTag: r.cvvAuthTag.slice(0, BLUEPRINT_LIMITS.SHORT_HEX_MAX),
-          csgSeal: r.csgSeal.slice(0, BLUEPRINT_LIMITS.CSG_MAX),
-        });
-      }
+      const deviceIdentity = await getDeviceSigningIdentity();
+      const { validEvents, rejectedEvents } = await verifyImportedOfflineBatch(parsed, {
+        trustedIssuerKeyIds: [deviceIdentity.keyId],
+        trustedStationKeyIds: trustedStationKeys,
+        requireStationCert: false,
+      });
 
-      if (validItems.length === 0) {
+      if (validEvents.length === 0) {
+        const firstReason = rejectedEvents[0]?.reason || 'Sin eventos verificables.';
         setImportBatchMsg({
           kind: 'warn',
-          msg: 'No se encontraron eventos CVV válidos dentro del archivo seleccionado.',
+          msg: `Importación bloqueada: ${rejectedEvents.length} evento(s) rechazado(s) por verificación criptográfica (${firstReason}).`,
         });
         return;
       }
 
-      const { added, skipped } = onImportOfflineBatch(validItems);
+      const { added, skipped } = onImportOfflineBatch(validEvents);
       setImportBatchMsg({
-        kind: added > 0 ? 'ok' : 'warn',
+        kind: added > 0 && rejectedEvents.length === 0 ? 'ok' : 'warn',
         msg:
           added > 0
-            ? `Se importaron ${added} evento(s) CVV a la cola local${skipped > 0 ? ` (${skipped} ya existentes omitidos)` : ''}. Pulsa "Sincronizar ahora" con red activa.`
-            : `Todos los eventos del archivo (${skipped}) ya estaban en la cola local.`,
+            ? `Importación verificada (ECDSA P-256): ${added} evento(s) auténtico(s) añadidos${skipped > 0 ? `, ${skipped} ya existente(s)` : ''}${rejectedEvents.length > 0 ? `, ${rejectedEvents.length} rechazado(s) por firma inválida` : ''}.`
+            : `Todos los eventos verificados (${skipped}) ya estaban en cola${rejectedEvents.length > 0 ? `; ${rejectedEvents.length} rechazado(s) por firma inválida` : ''}.`,
       });
     } catch {
       setImportBatchMsg({
@@ -698,8 +746,12 @@ export function TransfersSection({
       packageCode: selectedPackage.code,
       eventType,
       nonce: existingValid.acceptanceNonce,
+      acceptanceHash: existingValid.acceptanceHash || '',
+      acceptanceCryptoId: existingValid.acceptanceCryptoId || existingValid.acceptanceNonce,
       receiverName,
       zone,
+      receiverUid: operatorInfo?.uid || 'LOCAL_RECEIVER',
+      receiverDeviceId: getDeviceId(),
       capturedAt: new Date().toISOString(),
       isDuplicateNonce: true,
       duplicateReason:
@@ -814,10 +866,20 @@ export function TransfersSection({
                 <div className="space-y-3 md:col-span-5">
                   <QrCodeDisplay
                     value={acceptanceQrValue}
-                    label="QR de Aceptación (Receptor)"
-                    caption={acceptanceNonce}
+                    label="QR de Aceptación Firmado (Receptor)"
+                    caption={`${acceptanceCryptoId || acceptanceNonce}${acceptanceKeyId ? ` · #${acceptanceKeyId}` : ''}`}
                     size={144}
                   />
+                  {acceptanceHash && (
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 font-mono text-[10px] text-slate-600">
+                      <p className="truncate font-semibold text-slate-800">
+                        ID Criptográfico (Nonce + Hash): {acceptanceCryptoId}
+                      </p>
+                      <p className="mt-0.5 truncate">
+                        SHA-256 Receptor: {acceptanceHash}
+                      </p>
+                    </div>
+                  )}
                   <button
                     type="button"
                     onClick={handleReceiverIssueQr}
@@ -918,8 +980,13 @@ export function TransfersSection({
 
                   <button
                     type="button"
-                    onClick={() => validateAndApplyAcceptanceQr(acceptanceQrValue)}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                    disabled={!acceptanceQrValue}
+                    onClick={() => {
+                      if (acceptanceQrValue) {
+                        void validateAndApplyAcceptanceQr(acceptanceQrValue);
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-40"
                   >
                     Leer QR mostrado
                   </button>
@@ -977,9 +1044,9 @@ export function TransfersSection({
                   type="button"
                   disabled={!manualQrInput.trim()}
                   onClick={() => {
-                    if (validateAndApplyAcceptanceQr(manualQrInput)) {
-                      setManualQrInput('');
-                    }
+                    void validateAndApplyAcceptanceQr(manualQrInput).then((accepted) => {
+                      if (accepted) setManualQrInput('');
+                    });
                   }}
                   className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-40"
                 >
@@ -1011,8 +1078,20 @@ export function TransfersSection({
                       </button>
                     </div>
                     <p className="mt-0.5 font-mono text-[11px]">
-                      Paquete: {scannedAcceptance.packageCode} · Nonce: {scannedAcceptance.nonce}
+                      Paquete: {scannedAcceptance.packageCode} · ID (Nonce+Hash):{' '}
+                      {scannedAcceptance.acceptanceCryptoId || scannedAcceptance.nonce}
                     </p>
+                    <p className="mt-0.5 font-mono text-[11px] text-slate-700">
+                      Receptor verificado: {scannedAcceptance.receiverUid}
+                      {scannedAcceptance.proof?.receiverKeyId
+                        ? ` · Firma ECDSA P-256 #${scannedAcceptance.proof.receiverKeyId} (${scannedAcceptance.proof.signatureB64u.slice(0, 18)}…)`
+                        : ' · Sin firma ECDSA (simulación local)'}
+                    </p>
+                    {scannedAcceptance.acceptanceHash && (
+                      <p className="mt-0.5 truncate font-mono text-[10px] text-slate-500">
+                        Hash identidad SHA-256: {scannedAcceptance.acceptanceHash}
+                      </p>
+                    )}
                     {scannedAcceptance.duplicateReason && (
                       <p className="mt-1 text-[11px] font-medium text-amber-900">
                         {scannedAcceptance.duplicateReason}
@@ -1114,6 +1193,15 @@ export function TransfersSection({
                     <p className="mt-1 truncate">Event ID: {lastLocalCvv.eventId}</p>
                     <p className="truncate">IV (AES-256-GCM): {lastLocalCvv.iv}</p>
                     <p className="truncate">Sello CSG: {lastLocalCvv.csgSeal}</p>
+                    {lastLocalCvv.acceptanceCryptoId && (
+                      <p className="truncate">ID Aceptación (Nonce+Hash): {lastLocalCvv.acceptanceCryptoId}</p>
+                    )}
+                    {lastLocalCvv.receiverKeyId && (
+                      <p className="truncate">Firma del receptor en evento: #{lastLocalCvv.receiverKeyId}</p>
+                    )}
+                    {lastLocalCvv.stationKeyId && (
+                      <p className="truncate">Estación firmante ECDSA: #{lastLocalCvv.stationKeyId}</p>
+                    )}
                   </div>
                 )}
 
@@ -1215,10 +1303,23 @@ export function TransfersSection({
                       </p>
                       <p className="mt-0.5 truncate font-mono text-[11px] text-slate-600">
                         CVV: {item.eventId} · CSG: {item.csgSeal.slice(0, 16)}…
+                        {item.proof?.stationKeyId ? ` · Estación #${item.proof.stationKeyId}` : ''}
                       </p>
+                      {(item.receiverKeyId || item.proof?.acceptanceProof?.receiverKeyId) && (
+                        <p className="mt-0.5 truncate font-mono text-[11px] text-emerald-800">
+                          Firma receptor #{item.receiverKeyId || item.proof?.acceptanceProof?.receiverKeyId} ·{' '}
+                          {item.acceptanceCryptoId || item.proof?.acceptanceProof?.acceptanceCryptoId || item.acceptanceNonce}
+                        </p>
+                      )}
                       <p className="mt-0.5 font-mono text-[11px] text-slate-500">
                         {item.localTimestamp}
+                        {item.retryCount ? ` · Reintentos: ${item.retryCount}` : ''}
                       </p>
+                      {item.lastSyncError && (
+                        <p className="mt-1 text-[11px] font-medium text-red-700">
+                          Error en último envío: {item.lastSyncError}
+                        </p>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -1332,6 +1433,14 @@ export function TransfersSection({
                       <p className="mt-1 font-mono text-[11px] text-slate-500">
                         {ev.id} · {ev.capturedOffline ? `Offline Seq #${ev.offlineSequence}` : 'Online'}
                       </p>
+                      {(ev.receiverKeyId || ev.receiverSignature || ev.acceptanceCryptoId) && (
+                        <p className="mt-1 truncate font-mono text-[11px] text-emerald-800">
+                          Firma receptor {ev.receiverKeyId ? `#${ev.receiverKeyId}` : ''}
+                          {ev.receiverUid ? ` (${ev.receiverUid})` : ''}
+                          {ev.acceptanceCryptoId ? ` · ${ev.acceptanceCryptoId}` : ''}
+                          {ev.receiverSignature ? ` · ${ev.receiverSignature.slice(0, 16)}…` : ''}
+                        </p>
+                      )}
                       {ev.discrepancyNote && (
                         <p className="mt-1.5 text-[11px] font-medium text-amber-800">
                           Nota: {ev.discrepancyNote}

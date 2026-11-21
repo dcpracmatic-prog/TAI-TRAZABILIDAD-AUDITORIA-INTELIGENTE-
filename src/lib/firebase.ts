@@ -7,14 +7,37 @@ import {
   signOut,
   type User,
 } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
+import {
+  doc,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  type Firestore,
+} from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(
-  app,
-  (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId || '(default)'
-);
+const databaseId =
+  (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId || '(default)';
+
+let dbInstance: Firestore;
+try {
+  dbInstance = initializeFirestore(
+    app,
+    {
+      localCache: persistentLocalCache({
+        tabManager: persistentMultipleTabManager(),
+      }),
+    },
+    databaseId
+  );
+} catch {
+  dbInstance = getFirestore(app, databaseId);
+}
+
+export const db = dbInstance;
 export const auth = getAuth(app);
 
 export const WORKSPACE_SCOPES = [

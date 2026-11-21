@@ -13,12 +13,18 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from './firebase';
-import { sealCvvLocally } from './localCrypto';
+import {
+  decryptFromDeviceStorage,
+  encryptForDeviceStorage,
+  sealCvvLocally,
+} from './localCrypto';
+import { evaluateTransferIdempotency } from './offlineSyncEngine';
 import {
   type AuditAction,
   type AuditLog,
   type AuditSeverity,
   BLUEPRINT_LIMITS,
+  type CrossStationEventProof,
   type IdentificationStatus,
   type LifecycleStatus,
   type OfflinePendingEvent,
@@ -78,6 +84,13 @@ export async function sealEventOnDevice(params: {
   localTimestamp: string;
   observations: string;
   capturedOffline: boolean;
+  receiverSignatureMeta?: {
+    receiverUid: string;
+    receiverKeyId: string;
+    receiverSignature: string;
+    acceptanceHash: string;
+    acceptanceCryptoId: string;
+  };
 }) {
   const eventId = sanitizeId(
     params.eventId || generateEventId('EVT'),
@@ -96,6 +109,7 @@ export async function sealEventOnDevice(params: {
     observations: params.observations,
     capturedOffline: params.capturedOffline,
     deviceId: getDeviceId(),
+    receiverSignatureMeta: params.receiverSignatureMeta,
   });
   return {
     eventId,
@@ -367,7 +381,19 @@ export async function recordTransferEvent(params: {
     authTag: string;
     csgSeal: string;
   };
-}): Promise<{ eventId: string; duplicateOrConflict: boolean; reason?: string }> {
+  receiverSignatureMeta?: {
+    receiverUid: string;
+    receiverKeyId: string;
+    receiverSignature: string;
+    acceptanceHash: string;
+    acceptanceCryptoId: string;
+  };
+}): Promise<{
+  eventId: string;
+  duplicateOrConflict: boolean;
+  alreadySynced?: boolean;
+  reason?: string;
+}> {
   const eventsCol = collection(db, `packages/${params.pkg.id}/events`);
   const existingEventsSnap = await getDocs(
     query(eventsCol, where('ownerId', '==', params.ownerId))
@@ -375,14 +401,30 @@ export async function recordTransferEvent(params: {
 
   const existingEvents = existingEventsSnap.docs.map((d) => d.data() as TraceEvent);
 
-  // Rule 1: Duplicate acceptance QR / nonce detection
-  const duplicateNonce = existingEvents.find(
-    (ev) => ev.acceptanceNonce === params.acceptanceNonce
-  );
-  if (duplicateNonce) {
+  const decision = evaluateTransferIdempotency({
+    existingEvents,
+    acceptanceNonce: params.acceptanceNonce,
+    capturedOffline: params.capturedOffline,
+    offlineSequence: params.offlineSequence,
+    preSealed: params.preSealed
+      ? { eventId: params.preSealed.eventId, csgSeal: params.preSealed.csgSeal }
+      : undefined,
+  });
+
+  // Rule 0: Idempotent retry of an already-committed event (prevents false conflicts on partial retries)
+  if (decision.status === 'already_synced') {
+    return {
+      eventId: decision.existingEventId,
+      duplicateOrConflict: false,
+      alreadySynced: true,
+    };
+  }
+
+  // Rule 1: Genuine duplicate acceptance QR / nonce replay
+  if (decision.status === 'duplicate_qr_conflict') {
     const conflictEventId = sanitizeId(generateEventId('CONF'), BLUEPRINT_LIMITS.EVENT_ID_MAX);
     const logId = sanitizeId(generateEventId('LOG'), BLUEPRINT_LIMITS.EVENT_ID_MAX);
-    const reason = `QR de aceptación duplicado (${params.acceptanceNonce}). Rechazado al sincronizar.`;
+    const reason = decision.reason;
     const sealed = await sealEventOnDevice({
       packageId: params.pkg.id,
       eventId: conflictEventId,
@@ -445,14 +487,7 @@ export async function recordTransferEvent(params: {
   }
 
   // Rule 2: Incompatible offline sequence detection
-  const hasIncompatibleOffline =
-    params.capturedOffline &&
-    existingEvents.some(
-      (ev) =>
-        ev.capturedOffline &&
-        ev.offlineSequence >= params.offlineSequence &&
-        ev.cvvState === 'valid'
-    );
+  const hasIncompatibleOffline = decision.status === 'sequence_conflict';
 
   const sealed = params.preSealed
     ? params.preSealed
@@ -467,6 +502,7 @@ export async function recordTransferEvent(params: {
         localTimestamp: params.localTimestamp,
         observations: params.observations,
         capturedOffline: params.capturedOffline,
+        receiverSignatureMeta: params.receiverSignatureMeta,
       });
 
   const eventId = sanitizeId(sealed.eventId, BLUEPRINT_LIMITS.EVENT_ID_MAX);
@@ -482,6 +518,18 @@ export async function recordTransferEvent(params: {
         BLUEPRINT_LIMITS.DISCREPANCY_MAX
       )
     : clampStr(params.discrepancyNote, BLUEPRINT_LIMITS.DISCREPANCY_MAX);
+
+  const rxMeta = params.receiverSignatureMeta;
+  const optionalReceiverFields =
+    rxMeta && rxMeta.receiverSignature
+      ? {
+          acceptanceHash: clampStr(rxMeta.acceptanceHash, BLUEPRINT_LIMITS.HASH_MAX),
+          acceptanceCryptoId: clampStr(rxMeta.acceptanceCryptoId, BLUEPRINT_LIMITS.CRYPTO_ID_MAX),
+          receiverUid: clampStr(rxMeta.receiverUid, BLUEPRINT_LIMITS.ID_MAX * 2),
+          receiverKeyId: clampStr(rxMeta.receiverKeyId, BLUEPRINT_LIMITS.KEY_ID_MAX),
+          receiverSignature: clampStr(rxMeta.receiverSignature, BLUEPRINT_LIMITS.SIG_MAX),
+        }
+      : {};
 
   try {
     const batch = writeBatch(db);
@@ -505,6 +553,7 @@ export async function recordTransferEvent(params: {
       csgSeal: clampStr(sealed.csgSeal, BLUEPRINT_LIMITS.CSG_MAX),
       cvvState: finalCvvState,
       discrepancyNote: discrepancy,
+      ...optionalReceiverFields,
       createdAt: serverTimestamp(),
     });
 
@@ -529,7 +578,7 @@ export async function recordTransferEvent(params: {
       detail: clampStr(
         hasIncompatibleOffline
           ? `Conflicto offline detectado en ${params.pkg.code} (seq ${params.offlineSequence}).`
-          : `CVV generado en dispositivo (${params.eventType}) para ${params.pkg.code}: ${params.delivererName} → ${params.receiverName}${params.capturedOffline ? ' [Sincronizado desde cola offline]' : ''}.`,
+          : `CVV generado en dispositivo (${params.eventType}) para ${params.pkg.code}: ${params.delivererName} → ${params.receiverName}${rxMeta?.receiverKeyId ? ` [Receptor firmado #${rxMeta.receiverKeyId} · ${rxMeta.acceptanceCryptoId}]` : ''}${params.capturedOffline ? ' [Sincronizado desde cola offline]' : ''}.`,
         BLUEPRINT_LIMITS.OBS_MAX
       ),
       actorEmail: clampStr(params.ownerEmail, BLUEPRINT_LIMITS.EMAIL_MAX),
@@ -702,17 +751,117 @@ export function buildOfflineQueueStorageKey(userId: string): string {
   return `tai_offline_queue_${userId}`;
 }
 
-export function readOfflineQueue(userId: string): OfflinePendingEvent[] {
+export function buildOfflineSnapshotStorageKey(userId: string): string {
+  return `tai_offline_snapshot_${userId}`;
+}
+
+export function buildEventProofsStorageKey(userId: string): string {
+  return `tai_event_proofs_${userId}`;
+}
+
+export function buildTrustedStationsStorageKey(userId: string): string {
+  return `tai_trusted_stations_${userId}`;
+}
+
+export async function readEncryptedOfflineQueue(userId: string): Promise<OfflinePendingEvent[]> {
   try {
-    const raw = window.localStorage.getItem(buildOfflineQueueStorageKey(userId));
+    const key = buildOfflineQueueStorageKey(userId);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as OfflinePendingEvent[]) : [];
+    const decrypted = await decryptFromDeviceStorage<OfflinePendingEvent[]>(`queue:${userId}`, raw);
+    if (Array.isArray(decrypted)) return decrypted;
+
+    // One-time migration from legacy plaintext array if present, immediately re-encrypting
+    const legacy = JSON.parse(raw);
+    if (Array.isArray(legacy)) {
+      await writeEncryptedOfflineQueue(userId, legacy as OfflinePendingEvent[]);
+      return legacy as OfflinePendingEvent[];
+    }
+    return [];
   } catch {
     return [];
   }
 }
 
-export function writeOfflineQueue(userId: string, queue: OfflinePendingEvent[]): void {
-  window.localStorage.setItem(buildOfflineQueueStorageKey(userId), JSON.stringify(queue));
+export async function writeEncryptedOfflineQueue(
+  userId: string,
+  queue: OfflinePendingEvent[]
+): Promise<void> {
+  const encrypted = await encryptForDeviceStorage(`queue:${userId}`, queue);
+  window.localStorage.setItem(buildOfflineQueueStorageKey(userId), encrypted);
+}
+
+export interface OfflineAppSnapshot {
+  packages: TaiPackage[];
+  knownNonces: string[];
+  savedAt: string;
+}
+
+export async function writeEncryptedOfflineSnapshot(
+  userId: string,
+  snapshot: OfflineAppSnapshot
+): Promise<void> {
+  const encrypted = await encryptForDeviceStorage(`snapshot:${userId}`, snapshot);
+  window.localStorage.setItem(buildOfflineSnapshotStorageKey(userId), encrypted);
+}
+
+export async function readEncryptedOfflineSnapshot(
+  userId: string
+): Promise<OfflineAppSnapshot | null> {
+  try {
+    const raw = window.localStorage.getItem(buildOfflineSnapshotStorageKey(userId));
+    if (!raw) return null;
+    return await decryptFromDeviceStorage<OfflineAppSnapshot>(`snapshot:${userId}`, raw);
+  } catch {
+    return null;
+  }
+}
+
+export async function saveEventProofsToDevice(
+  userId: string,
+  proofs: Record<string, CrossStationEventProof>
+): Promise<void> {
+  const existing = await readAllEventProofsFromDevice(userId);
+  const merged = { ...existing, ...proofs };
+  const encrypted = await encryptForDeviceStorage(`proofs:${userId}`, merged);
+  window.localStorage.setItem(buildEventProofsStorageKey(userId), encrypted);
+}
+
+export async function readAllEventProofsFromDevice(
+  userId: string
+): Promise<Record<string, CrossStationEventProof>> {
+  try {
+    const raw = window.localStorage.getItem(buildEventProofsStorageKey(userId));
+    if (!raw) return {};
+    return (await decryptFromDeviceStorage<Record<string, CrossStationEventProof>>(
+      `proofs:${userId}`,
+      raw
+    )) || {};
+  } catch {
+    return {};
+  }
+}
+
+export async function registerTrustedStationKey(
+  userId: string,
+  stationKeyId: string
+): Promise<string[]> {
+  const current = await readTrustedStationKeys(userId);
+  if (!current.includes(stationKeyId)) {
+    const next = [...current, stationKeyId];
+    const encrypted = await encryptForDeviceStorage(`stations:${userId}`, next);
+    window.localStorage.setItem(buildTrustedStationsStorageKey(userId), encrypted);
+    return next;
+  }
+  return current;
+}
+
+export async function readTrustedStationKeys(userId: string): Promise<string[]> {
+  try {
+    const raw = window.localStorage.getItem(buildTrustedStationsStorageKey(userId));
+    if (!raw) return [];
+    return (await decryptFromDeviceStorage<string[]>(`stations:${userId}`, raw)) || [];
+  } catch {
+    return [];
+  }
 }

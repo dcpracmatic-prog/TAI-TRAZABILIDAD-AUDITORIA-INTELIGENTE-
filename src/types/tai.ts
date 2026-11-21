@@ -48,6 +48,10 @@ export const BLUEPRINT_LIMITS = {
   ORG_MAX: 160,
   TRL_MAX: 64,
   SHEET_TITLE_MAX: 200,
+  HASH_MAX: 128,
+  CRYPTO_ID_MAX: 160,
+  KEY_ID_MAX: 64,
+  SIG_MAX: 256,
   ID_PATTERN: /^[a-zA-Z0-9_-]+$/,
 } as const;
 
@@ -93,6 +97,11 @@ export interface TraceEvent {
   csgSeal: string;
   cvvState: CvvState;
   discrepancyNote: string;
+  acceptanceHash?: string;
+  acceptanceCryptoId?: string;
+  receiverUid?: string;
+  receiverKeyId?: string;
+  receiverSignature?: string;
   createdAt?: unknown;
 }
 
@@ -119,6 +128,45 @@ export interface PilotConfig {
   updatedAt?: unknown;
 }
 
+export interface AcceptanceProof {
+  version: 'TAI-ACCEPT-V2';
+  receiverUid: string;
+  receiverDeviceId: string;
+  receiverKeyId: string;
+  receiverPublicKeyB64u: string;
+  issuedAt: string;
+  acceptanceHash: string;
+  acceptanceCryptoId: string;
+  signatureB64u: string;
+}
+
+export interface StationCertificate {
+  version: 'TAI-STATION-CERT-V1';
+  stationKeyId: string;
+  stationPublicKeyB64u: string;
+  deviceId: string;
+  operatorUid: string;
+  operatorEmail: string;
+  issuedAt: string;
+  expiresAt: string;
+  issuerKeyId: string;
+  issuerPublicKeyB64u: string;
+  issuerSignatureB64u: string;
+}
+
+export interface CrossStationEventProof {
+  version: 'TAI-EVENT-PROOF-V1';
+  csgProviderId: 'webcrypto-ecdsa-p256-hmac-v1' | 'csg-rust-sello-integridad-wasm';
+  stationKeyId: string;
+  stationPublicKeyB64u: string;
+  stationSignatureB64u: string;
+  stationCert?: StationCertificate;
+  acceptanceProof?: AcceptanceProof;
+  deviceId?: string;
+  operatorUid?: string;
+  operatorEmail?: string;
+}
+
 export interface OfflinePendingEvent {
   localId: string;
   eventId: string;
@@ -140,6 +188,14 @@ export interface OfflinePendingEvent {
   cvvIv: string;
   cvvAuthTag: string;
   csgSeal: string;
+  acceptanceHash?: string;
+  acceptanceCryptoId?: string;
+  receiverUid?: string;
+  receiverKeyId?: string;
+  receiverSignature?: string;
+  proof?: CrossStationEventProof;
+  retryCount?: number;
+  lastSyncError?: string;
 }
 
 export interface GroundedPlace {

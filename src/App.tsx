@@ -8,23 +8,31 @@ import { OverviewSection } from './components/OverviewSection';
 import { PackagingSection } from './components/PackagingSection';
 import { TransfersSection } from './components/TransfersSection';
 import { googleSignIn, initAuth, logout } from './lib/firebase';
+import { syncOfflineQueueBatch } from './lib/offlineSyncEngine';
 import {
   createPackageWithPackEvent,
   invalidateCvvByCsg,
   loadPilotBaselineScenario,
   loadPilotConfig,
   logSheetsSyncAudit,
-  readOfflineQueue,
+  readAllEventProofsFromDevice,
+  readEncryptedOfflineQueue,
+  readEncryptedOfflineSnapshot,
+  readTrustedStationKeys,
   recordTransferEvent,
+  registerTrustedStationKey,
+  saveEventProofsToDevice,
   savePilotConfig,
   subscribeAuditLogs,
   subscribePackageEvents,
   subscribeUserPackages,
   validateUncertainMaterial,
-  writeOfflineQueue,
+  writeEncryptedOfflineQueue,
+  writeEncryptedOfflineSnapshot,
 } from './lib/taiService';
 import type {
   AuditLog,
+  CrossStationEventProof,
   IdentificationStatus,
   OfflinePendingEvent,
   PilotConfig,
@@ -105,6 +113,9 @@ function TaiWorkspace() {
   );
   const [autoSyncOnReconnect, setAutoSyncOnReconnect] = useState(true);
   const [offlineQueue, setOfflineQueue] = useState<OfflinePendingEvent[]>([]);
+  const [cachedKnownNonces, setCachedKnownNonces] = useState<string[]>([]);
+  const [trustedStationKeys, setTrustedStationKeys] = useState<string[]>([]);
+  const [eventProofs, setEventProofs] = useState<Record<string, CrossStationEventProof>>({});
   const [isBusy, setIsBusy] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [errorBanner, setErrorBanner] = useState('');
@@ -139,18 +150,40 @@ function TaiWorkspace() {
       setAuditLogs([]);
       setPilotConfig(null);
       setOfflineQueue([]);
+      setCachedKnownNonces([]);
+      setTrustedStationKeys([]);
+      setEventProofs({});
       return;
     }
 
-    setOfflineQueue(readOfflineQueue(user.uid));
+    let cancelled = false;
+    void (async () => {
+      const [queue, snapshot, proofs, stations] = await Promise.all([
+        readEncryptedOfflineQueue(user.uid),
+        readEncryptedOfflineSnapshot(user.uid),
+        readAllEventProofsFromDevice(user.uid),
+        readTrustedStationKeys(user.uid),
+      ]);
+      if (cancelled) return;
+      setOfflineQueue(queue);
+      setEventProofs(proofs);
+      setTrustedStationKeys(stations);
+      if (snapshot && snapshot.packages.length > 0) {
+        setPackages((prev) => (prev.length > 0 ? prev : snapshot.packages));
+        setCachedKnownNonces(snapshot.knownNonces || []);
+        setSelectedPackageId((prev) => prev || snapshot.packages[0]?.id || null);
+      }
+    })();
 
     const unsubPkgs = subscribeUserPackages(
       user.uid,
       (items) => {
-        setPackages(items);
-        setSelectedPackageId((prev) =>
-          prev && items.some((p) => p.id === prev) ? prev : items[0]?.id ?? null
-        );
+        if (items.length > 0 || !effectiveOffline) {
+          setPackages(items);
+          setSelectedPackageId((prev) =>
+            prev && items.some((p) => p.id === prev) ? prev : items[0]?.id ?? null
+          );
+        }
       },
       (err) => setErrorBanner(err.message)
     );
@@ -163,13 +196,33 @@ function TaiWorkspace() {
 
     loadPilotConfig(user.uid)
       .then((cfg) => setPilotConfig(cfg))
-      .catch((err) => setErrorBanner(err instanceof Error ? err.message : String(err)));
+      .catch((err) => {
+        if (!effectiveOffline) {
+          setErrorBanner(err instanceof Error ? err.message : String(err));
+        }
+      });
 
     return () => {
+      cancelled = true;
       unsubPkgs();
       unsubLogs();
     };
-  }, [user]);
+  }, [user, effectiveOffline]);
+
+  useEffect(() => {
+    if (!user || packages.length === 0) return;
+    const mergedNonces = Array.from(
+      new Set([
+        ...cachedKnownNonces,
+        ...events.filter((e) => e.cvvState === 'valid').map((e) => e.acceptanceNonce),
+      ])
+    ).slice(0, 500);
+    void writeEncryptedOfflineSnapshot(user.uid, {
+      packages,
+      knownNonces: mergedNonces,
+      savedAt: new Date().toISOString(),
+    });
+  }, [user, packages, events, cachedKnownNonces]);
 
   useEffect(() => {
     if (!user || !selectedPackageId) {
@@ -280,6 +333,13 @@ function TaiWorkspace() {
       authTag: string;
       csgSeal: string;
     };
+    receiverSignatureMeta?: {
+      receiverUid: string;
+      receiverKeyId: string;
+      receiverSignature: string;
+      acceptanceHash: string;
+      acceptanceCryptoId: string;
+    };
     localTimestamp: string;
   }) {
     if (!user) return { duplicateOrConflict: false };
@@ -310,7 +370,24 @@ function TaiWorkspace() {
     if (!user) return;
     const next = [...offlineQueue, item];
     setOfflineQueue(next);
-    writeOfflineQueue(user.uid, next);
+    void writeEncryptedOfflineQueue(user.uid, next);
+    if (item.proof) {
+      const nextProofs = { ...eventProofs, [item.eventId]: item.proof };
+      setEventProofs(nextProofs);
+      void saveEventProofsToDevice(user.uid, { [item.eventId]: item.proof });
+    }
+  }
+
+  function handleSaveEventProof(eventId: string, proof: CrossStationEventProof) {
+    if (!user) return;
+    setEventProofs((prev) => ({ ...prev, [eventId]: proof }));
+    void saveEventProofsToDevice(user.uid, { [eventId]: proof });
+  }
+
+  async function handleRegisterTrustedStation(stationKeyId: string) {
+    if (!user) return;
+    const next = await registerTrustedStationKey(user.uid, stationKeyId);
+    setTrustedStationKeys(next);
   }
 
   function handleImportOfflineBatch(items: OfflinePendingEvent[]): { added: number; skipped: number } {
@@ -318,6 +395,7 @@ function TaiWorkspace() {
     const existingIds = new Set(offlineQueue.map((q) => q.eventId));
     const existingNonces = new Set(offlineQueue.map((q) => q.acceptanceNonce));
     const toAdd: OfflinePendingEvent[] = [];
+    const proofsToStore: Record<string, CrossStationEventProof> = {};
     let skipped = 0;
 
     for (const item of items) {
@@ -328,13 +406,20 @@ function TaiWorkspace() {
       existingIds.add(item.eventId);
       existingNonces.add(item.acceptanceNonce);
       toAdd.push(item);
+      if (item.proof) {
+        proofsToStore[item.eventId] = item.proof;
+      }
     }
 
     if (toAdd.length > 0) {
       const next = [...offlineQueue, ...toAdd];
       setOfflineQueue(next);
-      writeOfflineQueue(user.uid, next);
-      setStatusMessage(`Importados ${toAdd.length} evento(s) CVV desde estación HTML offline.`);
+      void writeEncryptedOfflineQueue(user.uid, next);
+      if (Object.keys(proofsToStore).length > 0) {
+        setEventProofs((prev) => ({ ...prev, ...proofsToStore }));
+        void saveEventProofsToDevice(user.uid, proofsToStore);
+      }
+      setStatusMessage(`Importados y verificados ${toAdd.length} evento(s) CVV desde estación HTML offline.`);
     }
     return { added: toAdd.length, skipped };
   }
@@ -345,56 +430,73 @@ function TaiWorkspace() {
     setIsBusy(true);
     setErrorBanner('');
     try {
-      let synced = 0;
-      let conflicts = 0;
-      const remaining: OfflinePendingEvent[] = [];
+      const summary = await syncOfflineQueueBatch({
+        queue: offlineQueue,
+        packages,
+        uploadItem: async (item, pkg) => {
+          const nextLifecycle =
+            item.eventType === 'return'
+              ? 'return_open'
+              : item.eventType === 'dispatch'
+                ? 'in_transit'
+                : 'received';
+          return recordTransferEvent({
+            pkg,
+            ownerId: user.uid,
+            ownerEmail: user.email || 'operador@tai.local',
+            eventType: item.eventType,
+            delivererName: item.delivererName,
+            receiverName: item.receiverName,
+            zone: item.zone,
+            functionRole: item.functionRole,
+            observations: item.observations,
+            acceptanceNonce: item.acceptanceNonce,
+            capturedOffline: true,
+            offlineSequence: item.offlineSequence,
+            localTimestamp: item.localTimestamp,
+            sealStatus: item.sealStatus,
+            discrepancyNote: item.discrepancyNote,
+            nextLifecycleStatus: nextLifecycle,
+            preSealed: {
+              eventId: item.eventId,
+              ciphertext: item.cvvCiphertext,
+              iv: item.cvvIv,
+              authTag: item.cvvAuthTag,
+              csgSeal: item.csgSeal,
+            },
+            receiverSignatureMeta:
+              item.receiverSignature || item.proof?.acceptanceProof
+                ? {
+                    receiverUid: item.receiverUid || item.proof?.acceptanceProof?.receiverUid || '',
+                    receiverKeyId:
+                      item.receiverKeyId || item.proof?.acceptanceProof?.receiverKeyId || '',
+                    receiverSignature:
+                      item.receiverSignature || item.proof?.acceptanceProof?.signatureB64u || '',
+                    acceptanceHash:
+                      item.acceptanceHash || item.proof?.acceptanceProof?.acceptanceHash || '',
+                    acceptanceCryptoId:
+                      item.acceptanceCryptoId ||
+                      item.proof?.acceptanceProof?.acceptanceCryptoId ||
+                      '',
+                  }
+                : undefined,
+          });
+        },
+        onQueueProgress: async (nextQueue) => {
+          setOfflineQueue(nextQueue);
+          await writeEncryptedOfflineQueue(user.uid, nextQueue);
+        },
+      });
 
-      for (const item of offlineQueue) {
-        const pkg = packages.find((p) => p.id === item.packageId);
-        if (!pkg) {
-          remaining.push(item);
-          continue;
-        }
-        const nextLifecycle =
-          item.eventType === 'return'
-            ? 'return_open'
-            : item.eventType === 'dispatch'
-              ? 'in_transit'
-              : 'received';
-        const res = await recordTransferEvent({
-          pkg,
-          ownerId: user.uid,
-          ownerEmail: user.email || 'operador@tai.local',
-          eventType: item.eventType,
-          delivererName: item.delivererName,
-          receiverName: item.receiverName,
-          zone: item.zone,
-          functionRole: item.functionRole,
-          observations: item.observations,
-          acceptanceNonce: item.acceptanceNonce,
-          capturedOffline: true,
-          offlineSequence: item.offlineSequence,
-          localTimestamp: item.localTimestamp,
-          sealStatus: item.sealStatus,
-          discrepancyNote: item.discrepancyNote,
-          nextLifecycleStatus: nextLifecycle,
-          preSealed: {
-            eventId: item.eventId,
-            ciphertext: item.cvvCiphertext,
-            iv: item.cvvIv,
-            authTag: item.cvvAuthTag,
-            csgSeal: item.csgSeal,
-          },
-        });
-        if (res.duplicateOrConflict) conflicts += 1;
-        else synced += 1;
+      if (summary.failed > 0 && summary.lastError) {
+        setErrorBanner(
+          `Sincronización parcial: ${summary.synced} enviado(s), ${summary.alreadySynced} ya confirmados, ${summary.failed} con error (${summary.lastError}). Los enviados ya fueron retirados de la cola.`
+        );
+      } else {
+        setStatusMessage(
+          `Sincronización offline completada: ${summary.synced} enviado(s), ${summary.alreadySynced} idempotente(s), ${summary.conflicts} conflicto(s).`
+        );
       }
-
-      setOfflineQueue(remaining);
-      writeOfflineQueue(user.uid, remaining);
-      setStatusMessage(
-        `Sincronización offline completada: ${synced} CVV enviados, ${conflicts} conflicto(s) marcados para revisión.`
-      );
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : String(err));
     } finally {
@@ -597,6 +699,10 @@ function TaiWorkspace() {
             selectedPackage={selectedPackage}
             onSelectPackage={setSelectedPackageId}
             events={events}
+            cachedKnownNonces={cachedKnownNonces}
+            trustedStationKeys={trustedStationKeys}
+            onRegisterTrustedStation={handleRegisterTrustedStation}
+            onSaveEventProof={handleSaveEventProof}
             isOffline={effectiveOffline}
             autoSyncOnReconnect={autoSyncOnReconnect}
             onToggleAutoSync={() => setAutoSyncOnReconnect((prev) => !prev)}
@@ -626,6 +732,8 @@ function TaiWorkspace() {
             selectedPackage={selectedPackage}
             events={events}
             auditLogs={auditLogs}
+            eventProofs={eventProofs}
+            trustedStationKeys={trustedStationKeys}
             pilotConfig={pilotConfig}
             accessToken={accessToken}
             isAuthenticated={Boolean(user)}

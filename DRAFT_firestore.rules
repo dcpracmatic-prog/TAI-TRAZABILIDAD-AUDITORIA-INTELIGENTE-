@@ -73,7 +73,9 @@ service cloud.firestore {
         'receiverName', 'zone', 'functionRole', 'observations',
         'acceptanceNonce', 'capturedOffline', 'offlineSequence',
         'localTimestamp', 'cvvCiphertext', 'cvvIv', 'cvvAuthTag',
-        'csgSeal', 'cvvState', 'discrepancyNote', 'createdAt'
+        'csgSeal', 'cvvState', 'discrepancyNote', 'acceptanceHash',
+        'acceptanceCryptoId', 'receiverUid', 'receiverKeyId',
+        'receiverSignature', 'createdAt'
       ]) &&
       isValidId(data.id) &&
       data.packageId == packageId &&
@@ -94,6 +96,11 @@ service cloud.firestore {
       data.csgSeal is string && data.csgSeal.size() >= 1 && data.csgSeal.size() <= 128 &&
       data.cvvState in ['valid', 'invalidated_csg', 'conflict'] &&
       data.discrepancyNote is string && data.discrepancyNote.size() <= 400 &&
+      (!('acceptanceHash' in data) || (data.acceptanceHash is string && data.acceptanceHash.size() <= 128)) &&
+      (!('acceptanceCryptoId' in data) || (data.acceptanceCryptoId is string && data.acceptanceCryptoId.size() <= 160)) &&
+      (!('receiverUid' in data) || (data.receiverUid is string && data.receiverUid.size() <= 128)) &&
+      (!('receiverKeyId' in data) || (data.receiverKeyId is string && data.receiverKeyId.size() <= 64)) &&
+      (!('receiverSignature' in data) || (data.receiverSignature is string && data.receiverSignature.size() <= 256)) &&
       data.createdAt is timestamp;
     }
 

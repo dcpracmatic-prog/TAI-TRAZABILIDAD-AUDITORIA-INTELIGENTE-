@@ -1,5 +1,20 @@
+import { getDeviceSigningIdentity } from './localCrypto';
+import {
+  buildOfflineCryptoBrowserRuntime,
+  sealOfflineCredentialVault,
+  sealTransferEventOffline,
+  verifyTransferEventOffline,
+} from './offlineCrypto';
 import { OFFLINE_JSQR_JS, OFFLINE_QRCODE_JS } from './offlineVendorStrings';
-import type { OfflinePendingEvent, PilotConfig, TaiPackage, TraceEvent } from '../types/tai';
+import type {
+  OfflinePendingEvent,
+  PilotConfig,
+  StationCertificate,
+  TaiPackage,
+  TraceEvent,
+} from '../types/tai';
+
+export { sealTransferEventOffline, verifyTransferEventOffline };
 
 export interface OfflineHtmlExportParams {
   passphrase: string;
@@ -13,12 +28,7 @@ export interface OfflineHtmlExportParams {
   events: TraceEvent[];
   offlineQueue: OfflinePendingEvent[];
   pilotConfig: PilotConfig | null;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+  issuerSigner?: { privateKey: CryptoKey; publicKeyB64u: string; keyId: string };
 }
 
 function safeJsonForHtmlScript(value: unknown): string {
@@ -30,75 +40,17 @@ function safeJsonForHtmlScript(value: unknown): string {
     .replace(/\u2029/g, '\\u2029');
 }
 
-async function deriveWrappingKey(passphrase: string, salt: Uint8Array, iterations: number) {
-  const baseKey = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(passphrase),
-    'PBKDF2',
-    false,
-    ['deriveKey']
-  );
-
-  return crypto.subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt: salt.buffer as ArrayBuffer,
-      iterations,
-      hash: 'SHA-256',
-    },
-    baseKey,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
 export async function generateProtectedOfflineHtml(
   params: OfflineHtmlExportParams
-): Promise<{ html: string; filename: string; expiresAt: string }> {
-  if (params.passphrase.trim().length < 8) {
-    throw new Error('La clave de protección offline debe tener al menos 8 caracteres.');
-  }
-
-  const iterations = 310000;
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const wrappingKey = await deriveWrappingKey(params.passphrase, salt, iterations);
-
-  // Generate dedicated offline session keys (never exposed in plaintext in the HTML)
-  const offlineAesKey = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 },
-    true,
-    ['encrypt', 'decrypt']
-  );
-  const offlineHmacKey = await crypto.subtle.generateKey(
-    { name: 'HMAC', hash: 'SHA-256', length: 256 },
-    true,
-    ['sign', 'verify']
-  );
-
-  const aesJwk = await crypto.subtle.exportKey('jwk', offlineAesKey);
-  const hmacJwk = await crypto.subtle.exportKey('jwk', offlineHmacKey);
-
-  const issuedAt = new Date().toISOString();
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
-  const identityCanonical = [
-    params.user.uid,
-    params.user.email,
-    params.deviceId,
-    issuedAt,
-    expiresAt,
-  ].join('|');
-
-  const attestationSig = await crypto.subtle.sign(
-    'HMAC',
-    offlineHmacKey,
-    new TextEncoder().encode(identityCanonical)
-  );
-
-  const vaultPlaintext = {
-    v: 'TAI-OFFLINE-VAULT-V1',
+): Promise<{
+  html: string;
+  filename: string;
+  expiresAt: string;
+  stationIdentity: { keyId: string; publicKeyB64u: string; stationCert?: StationCertificate };
+}> {
+  const issuerSigner = params.issuerSigner || (await getDeviceSigningIdentity());
+  const { vaultEnvelope, stationIdentity, expiresAt } = await sealOfflineCredentialVault({
+    passphrase: params.passphrase,
     operator: {
       uid: params.user.uid,
       email: params.user.email,
@@ -106,27 +58,8 @@ export async function generateProtectedOfflineHtml(
       role: 'Operador Autorizado Offline',
     },
     deviceId: params.deviceId,
-    issuedAt,
-    expiresAt,
-    authAttestation: bytesToHex(new Uint8Array(attestationSig)),
-    keys: {
-      aesJwk,
-      hmacJwk,
-    },
-  };
-
-  const encoder = new TextEncoder();
-  const aad = encoder.encode('TAI-OFFLINE-VAULT-V1');
-  const encryptedBuf = await crypto.subtle.encrypt(
-    {
-      name: 'AES-GCM',
-      iv: iv.buffer as ArrayBuffer,
-      additionalData: aad,
-      tagLength: 128,
-    },
-    wrappingKey,
-    encoder.encode(JSON.stringify(vaultPlaintext))
-  );
+    issuerSigner,
+  });
 
   const knownNonces = Array.from(
     new Set([
@@ -136,15 +69,7 @@ export async function generateProtectedOfflineHtml(
   ).slice(0, 500);
 
   const bundlePayload = {
-    vault: {
-      version: 'TAI-OFFLINE-VAULT-V1',
-      algorithm: 'PBKDF2-SHA256 + AES-256-GCM + CSG-HMAC-SHA256',
-      iterations,
-      saltHex: bytesToHex(salt),
-      ivHex: bytesToHex(iv),
-      ciphertextHex: bytesToHex(new Uint8Array(encryptedBuf)),
-      expiresAt,
-    },
+    vault: vaultEnvelope,
     pilotMeta: {
       solverOrg: params.pilotConfig?.solverOrg || 'Organización Postulante TAI',
       pilotFacility: params.pilotConfig?.pilotFacility || 'Centro Logístico Buenos Aires — YPF',
@@ -169,7 +94,7 @@ export async function generateProtectedOfflineHtml(
   const filename = `tai-estacion-offline-${dateSlug}.html`;
   const html = buildStandaloneHtmlDocument(bundlePayload);
 
-  return { html, filename, expiresAt };
+  return { html, filename, expiresAt, stationIdentity };
 }
 
 function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
@@ -640,9 +565,11 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
   <script id="tai-offline-bundle" type="application/json">${safeJson}</script>
   <script>${OFFLINE_QRCODE_JS}</script>
   <script>${OFFLINE_JSQR_JS}</script>
+  <script>${buildOfflineCryptoBrowserRuntime()}</script>
   <script>
   (function () {
     "use strict";
+    var CryptoEngine = window.TaiOfflineCrypto;
     var bundleEl = document.getElementById("tai-offline-bundle");
     var BUNDLE = JSON.parse(bundleEl.textContent || "{}");
 
@@ -658,27 +585,8 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
 
     function $(id) { return document.getElementById(id); }
 
-    function hexToBytes(hex) {
-      var clean = String(hex || "").trim();
-      var out = new Uint8Array(clean.length / 2);
-      for (var i = 0; i < out.length; i++) {
-        out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-      }
-      return out;
-    }
-
-    function bytesToHex(bytes) {
-      return Array.from(bytes).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
-    }
-
     function generateNonce() {
-      var rnd = crypto.getRandomValues(new Uint8Array(4));
-      return "ACC_" + Date.now().toString(36).toUpperCase() + "_" + bytesToHex(rnd).toUpperCase();
-    }
-
-    function generateEventId() {
-      var rnd = crypto.getRandomValues(new Uint8Array(4));
-      return "CVV_OFF_" + Date.now().toString(36).toUpperCase() + "_" + bytesToHex(rnd).toUpperCase();
+      return CryptoEngine.generateNonce();
     }
 
     function eventLabel(t) {
@@ -693,97 +601,15 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
     $("vault-exp-label").textContent = (BUNDLE.vault && BUNDLE.vault.expiresAt) || "";
 
     async function unlockVault(passphrase) {
-      var v = BUNDLE.vault;
-      var enc = new TextEncoder();
-      var salt = hexToBytes(v.saltHex);
-      var iv = hexToBytes(v.ivHex);
-      var ct = hexToBytes(v.ciphertextHex);
-
-      var baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
-      var wrapKey = await crypto.subtle.deriveKey(
-        { name: "PBKDF2", salt: salt, iterations: v.iterations || 310000, hash: "SHA-256" },
-        baseKey,
-        { name: "AES-GCM", length: 256 },
-        false,
-        ["decrypt"]
-      );
-
-      var plainBuf = await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: iv, additionalData: enc.encode("TAI-OFFLINE-VAULT-V1"), tagLength: 128 },
-        wrapKey,
-        ct
-      );
-
-      var vaultData = JSON.parse(new TextDecoder().decode(plainBuf));
-      if (!vaultData || vaultData.v !== "TAI-OFFLINE-VAULT-V1") {
-        throw new Error("Formato de bóveda inválido.");
-      }
-      if (Date.now() > Date.parse(vaultData.expiresAt)) {
-        throw new Error("La credencial offline ha expirado. Descarga una nueva estación desde la plataforma.");
-      }
-
-      // Import keys as non-extractable in runtime memory
-      var aesKey = await crypto.subtle.importKey(
-        "jwk",
-        vaultData.keys.aesJwk,
-        { name: "AES-GCM", length: 256 },
-        false,
-        ["encrypt", "decrypt"]
-      );
-      var hmacKey = await crypto.subtle.importKey(
-        "jwk",
-        vaultData.keys.hmacJwk,
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign", "verify"]
-      );
-
-      var canonical = [
-        vaultData.operator.uid,
-        vaultData.operator.email,
-        vaultData.deviceId,
-        vaultData.issuedAt,
-        vaultData.expiresAt
-      ].join("|");
-
-      var validSig = await crypto.subtle.verify(
-        "HMAC",
-        hmacKey,
-        hexToBytes(vaultData.authAttestation),
-        enc.encode(canonical)
-      );
-      if (!validSig) {
-        throw new Error("La firma de autenticación del operador no es válida.");
-      }
-
-      session = {
-        operator: vaultData.operator,
-        deviceId: vaultData.deviceId,
-        issuedAt: vaultData.issuedAt,
-        expiresAt: vaultData.expiresAt,
-        aesKey: aesKey,
-        hmacKey: hmacKey,
-        storageKey: "tai_off_q_" + v.saltHex.slice(0, 16)
-      };
-
+      session = await CryptoEngine.unlockVault(BUNDLE.vault, passphrase);
       await loadEncryptedQueue();
     }
 
     async function saveEncryptedQueue() {
       if (!session) return;
       try {
-        var enc = new TextEncoder();
-        var iv = crypto.getRandomValues(new Uint8Array(12));
-        var data = enc.encode(JSON.stringify(offlineQueue));
-        var ct = await crypto.subtle.encrypt(
-          { name: "AES-GCM", iv: iv, additionalData: enc.encode(session.deviceId), tagLength: 128 },
-          session.aesKey,
-          data
-        );
-        localStorage.setItem(session.storageKey, JSON.stringify({
-          iv: bytesToHex(iv),
-          ct: bytesToHex(new Uint8Array(ct))
-        }));
+        var blob = await CryptoEngine.encryptQueueBlob(offlineQueue, session);
+        localStorage.setItem(session.storageKey, JSON.stringify(blob));
       } catch (e) {
         // localStorage may be restricted in strict file:// private modes; in-memory queue still works
       }
@@ -796,17 +622,7 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
         var raw = localStorage.getItem(session.storageKey);
         if (!raw) return;
         var parsed = JSON.parse(raw);
-        var dec = await crypto.subtle.decrypt(
-          {
-            name: "AES-GCM",
-            iv: hexToBytes(parsed.iv),
-            additionalData: new TextEncoder().encode(session.deviceId),
-            tagLength: 128
-          },
-          session.aesKey,
-          hexToBytes(parsed.ct)
-        );
-        var items = JSON.parse(new TextDecoder().decode(dec));
+        var items = await CryptoEngine.decryptQueueBlob(parsed, session);
         if (Array.isArray(items)) offlineQueue = items;
       } catch (e) {
         offlineQueue = [];
@@ -822,57 +638,39 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
       return list[0] || null;
     }
 
-    function currentAcceptanceString() {
-      var pkg = getSelectedPkg();
-      if (!pkg) return "";
-      return [
-        "tai://accept",
-        pkg.id,
-        activeMode,
-        acceptanceNonce,
-        $("receiver-name").value.trim() || "Receptor en sitio",
-        $("zone-name").value.trim() || "Centro Logístico Buenos Aires"
-      ].join("|");
-    }
+    var currentAcceptanceQr = "";
 
-    function renderAcceptanceQr() {
-      var value = currentAcceptanceString();
-      $("acceptance-qr-text").textContent = value || "Sin paquetes disponibles";
-      $("acceptance-nonce-label").textContent = acceptanceNonce;
-      if (value && window.TaiQrLib && typeof window.TaiQrLib.toDataURL === "function") {
-        window.TaiQrLib.toDataURL(value, { width: 180, margin: 1, errorCorrectionLevel: "M" }, function (err, url) {
+    async function renderAcceptanceQr() {
+      var pkg = getSelectedPkg();
+      if (!pkg || !session) {
+        currentAcceptanceQr = "";
+        $("acceptance-qr-text").textContent = "Sin paquetes disponibles";
+        return;
+      }
+      var signed = await CryptoEngine.signAcceptanceQr({
+        packageId: pkg.id,
+        eventType: activeMode,
+        nonce: acceptanceNonce,
+        receiverName: $("receiver-name").value.trim() || session.operator.displayName || "Receptor en sitio",
+        zone: $("zone-name").value.trim() || "Centro Logístico Buenos Aires"
+      }, session);
+      currentAcceptanceQr = signed.qrString;
+      $("acceptance-qr-text").textContent = signed.qrString;
+      $("acceptance-nonce-label").textContent = (signed.acceptanceCryptoId || acceptanceNonce) + " · Firma #" + session.stationKeyId;
+      if (signed.qrString && window.TaiQrLib && typeof window.TaiQrLib.toDataURL === "function") {
+        window.TaiQrLib.toDataURL(signed.qrString, { width: 180, margin: 1, errorCorrectionLevel: "M" }, function (err, url) {
           if (!err && url) $("acceptance-qr-img").src = url;
         });
       }
     }
 
-    function parseAcceptanceQr(raw) {
-      var trimmed = String(raw || "").trim();
-      if (trimmed.indexOf("tai://accept|") === 0) {
-        var parts = trimmed.split("|");
-        if (parts.length >= 4) {
-          var pkgId = (parts[1] || "").trim();
-          var evt = (parts[2] || "").trim();
-          var nonce = (parts[3] || "").trim();
-          if (!pkgId || (evt !== "dispatch" && evt !== "receive" && evt !== "return") || nonce.length < 4) return null;
-          return {
-            packageId: pkgId,
-            eventType: evt,
-            nonce: nonce,
-            receiverName: (parts[4] || "").trim() || "Receptor en sitio",
-            zone: (parts[5] || "").trim() || "Centro Logístico Buenos Aires"
-          };
-        }
-      }
-      return null;
-    }
-
-    function validateAcceptanceQr(raw) {
-      var parsed = parseAcceptanceQr(raw);
-      if (!parsed) {
-        setFeedback("El código escaneado no es un QR de aceptación TAI válido (tai://accept|...).", "warn");
+    async function validateAcceptanceQr(raw) {
+      var verified = await CryptoEngine.parseAndVerifyAcceptanceQr(raw);
+      if (!verified.valid || !verified.parsed) {
+        setFeedback(verified.reason || "El código escaneado no es un QR de aceptación TAI válido.", "warn");
         return false;
       }
+      var parsed = verified.parsed;
       var list = BUNDLE.packages || [];
       var found = null;
       for (var i = 0; i < list.length; i++) {
@@ -899,8 +697,13 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
         packageCode: found.code,
         eventType: parsed.eventType,
         nonce: parsed.nonce,
+        acceptanceHash: parsed.acceptanceHash,
+        acceptanceCryptoId: parsed.acceptanceCryptoId,
         receiverName: parsed.receiverName,
-        zone: parsed.zone
+        zone: parsed.zone,
+        receiverUid: parsed.receiverUid,
+        receiverDeviceId: parsed.receiverDeviceId,
+        proof: parsed.proof
       };
 
       $("pkg-select").value = found.id;
@@ -911,9 +714,9 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
 
       var banner = $("validated-qr-banner");
       banner.className = "alert ok";
-      banner.textContent = "Inicio de transferencia validado: " + eventLabel(parsed.eventType) + " · Paquete " + found.code + " · Nonce " + parsed.nonce;
+      banner.textContent = "Receptor verificado (" + parsed.receiverUid + " · #" + parsed.proof.receiverKeyId + ") · ID " + parsed.acceptanceCryptoId + " · " + eventLabel(parsed.eventType) + " · Paquete " + found.code;
       $("btn-generate-cvv").disabled = false;
-      setFeedback("QR de aceptación validado. Ya puedes generar el CVV offline.", "ok");
+      setFeedback("QR de aceptación firmado y verificado. Ya puedes generar el CVV offline.", "ok");
       return true;
     }
 
@@ -931,7 +734,7 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
       });
       $("discrepancy-group").classList.toggle("hidden", activeMode !== "return");
       $("discrepancy-note").required = activeMode === "return";
-      renderAcceptanceQr();
+      void renderAcceptanceQr();
     }
 
     function stopCamera() {
@@ -968,7 +771,7 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
         var canvas = document.createElement("canvas");
         var ctx = canvas.getContext("2d");
 
-        var tick = function () {
+        var tick = async function () {
           if (!cameraStream) return;
           if (!scanBusy && video.readyState === video.HAVE_ENOUGH_DATA && window.TaiJsQrLib) {
             scanBusy = true;
@@ -978,7 +781,7 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
               ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
               var imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
               var res = window.TaiJsQrLib(imgData.data, canvas.width, canvas.height, { inversionAttempts: "dontInvert" });
-              if (res && res.data && validateAcceptanceQr(res.data)) {
+              if (res && res.data && await validateAcceptanceQr(res.data)) {
                 stopCamera();
                 scanBusy = false;
                 return;
@@ -987,9 +790,9 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
               scanBusy = false;
             }
           }
-          cameraRaf = requestAnimationFrame(tick);
+          cameraRaf = requestAnimationFrame(function () { void tick(); });
         };
-        cameraRaf = requestAnimationFrame(tick);
+        cameraRaf = requestAnimationFrame(function () { void tick(); });
       } catch (err) {
         stopCamera();
         $("camera-error").textContent = "No se pudo abrir la cámara (" + (err && err.message ? err.message : "permiso denegado") + "). Usa Imagen QR o Leer QR mostrado.";
@@ -1085,37 +888,10 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
       if (!item) return;
 
       var resBox = $("audit-result");
-      try {
-        var enc = new TextEncoder();
-        var authTag = tamper ? (item.cvvAuthTag.slice(0, -4) + "ffff") : item.cvvAuthTag;
-        var canonical = [item.packageId, item.eventId, item.eventType, item.acceptanceNonce, authTag].join("|");
-        var sigOk = await crypto.subtle.verify("HMAC", session.hmacKey, hexToBytes(item.csgSeal), enc.encode(canonical));
-        if (!sigOk) {
-          resBox.className = "alert danger";
-          resBox.textContent = "CSG OUT_OF_FLOW / INVALIDATED: El sello CSG no coincide tras la alteración simulada. El registro maestro se conserva intacto.";
-          resBox.classList.remove("hidden");
-          return;
-        }
-        var ctBytes = hexToBytes(item.cvvCiphertext);
-        var tagBytes = hexToBytes(authTag);
-        var combined = new Uint8Array(ctBytes.length + tagBytes.length);
-        combined.set(ctBytes, 0);
-        combined.set(tagBytes, ctBytes.length);
-
-        var plainBuf = await crypto.subtle.decrypt(
-          { name: "AES-GCM", iv: hexToBytes(item.cvvIv), additionalData: enc.encode(item.packageId + ":" + item.eventId), tagLength: 128 },
-          session.aesKey,
-          combined
-        );
-        var payload = JSON.parse(new TextDecoder().decode(plainBuf));
-        resBox.className = "alert ok";
-        resBox.textContent = "VERIFIED (AES-256-GCM + CSG): Operador autenticado " + payload.operatorEmail + " · Paquete " + payload.packageId + " · Nonce " + payload.acceptanceNonce + " · Emitido " + payload.localTimestamp;
-        resBox.classList.remove("hidden");
-      } catch (err) {
-        resBox.className = "alert danger";
-        resBox.textContent = "INVALIDATED_TAMPERED: Fallo de autenticación AES-256-GCM.";
-        resBox.classList.remove("hidden");
-      }
+      var result = await CryptoEngine.verifyTransferEvent(item, session, tamper);
+      resBox.className = result.valid ? "alert ok" : "alert danger";
+      resBox.textContent = result.reason;
+      resBox.classList.remove("hidden");
     }
 
     function populatePackagesAndCredentials() {
@@ -1156,9 +932,10 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
           "Operador autenticado: " + session.operator.displayName + " (" + session.operator.email + ")",
           "UID protegido: " + session.operator.uid,
           "Dispositivo autorizado: " + session.deviceId,
+          "Clave de firma estación (ECDSA P-256): #" + session.stationKeyId + (session.stationCert ? " · Certificada por #" + session.stationCert.issuerKeyId : ""),
           "Emitida: " + session.issuedAt,
           "Expira: " + session.expiresAt,
-          "Criptografía activa: PBKDF2-SHA256 (310,000 iter.) + AES-256-GCM + CSG HMAC-SHA256 (llaves no exportables en memoria)"
+          "Criptografía activa: Piloto Web Crypto (PBKDF2-SHA256 + AES-256-GCM + ECDSA P-256 + HMAC-SHA256; adaptador preparado para crate Rust sello_integridad)"
         ].forEach(function (line) {
           var div = document.createElement("div");
           div.className = "mono";
@@ -1190,7 +967,7 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
 
         acceptanceNonce = generateNonce();
         populatePackagesAndCredentials();
-        renderAcceptanceQr();
+        await renderAcceptanceQr();
         renderQueueAndAudit();
       } catch (err) {
         errEl.textContent = (err && err.message) ? err.message : "Clave incorrecta o bóveda dañada.";
@@ -1233,26 +1010,26 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
       });
     });
 
-    $("pkg-select").addEventListener("change", renderAcceptanceQr);
-    $("receiver-name").addEventListener("input", renderAcceptanceQr);
-    $("zone-name").addEventListener("input", renderAcceptanceQr);
+    $("pkg-select").addEventListener("change", function () { void renderAcceptanceQr(); });
+    $("receiver-name").addEventListener("input", function () { void renderAcceptanceQr(); });
+    $("zone-name").addEventListener("input", function () { void renderAcceptanceQr(); });
     $("btn-new-acceptance").addEventListener("click", function () {
       acceptanceNonce = generateNonce();
-      renderAcceptanceQr();
+      void renderAcceptanceQr();
     });
 
     $("btn-toggle-camera").addEventListener("click", function () {
       if (cameraStream) stopCamera();
-      else startCamera();
+      else void startCamera();
     });
 
-    $("btn-read-shown-qr").addEventListener("click", function () {
-      validateAcceptanceQr(currentAcceptanceString());
+    $("btn-read-shown-qr").addEventListener("click", async function () {
+      await validateAcceptanceQr(currentAcceptanceQr);
     });
 
-    $("btn-load-manual-qr").addEventListener("click", function () {
+    $("btn-load-manual-qr").addEventListener("click", async function () {
       var val = $("manual-qr-input").value;
-      if (validateAcceptanceQr(val)) $("manual-qr-input").value = "";
+      if (await validateAcceptanceQr(val)) $("manual-qr-input").value = "";
     });
 
     $("qr-file-input").addEventListener("change", function (e) {
@@ -1260,7 +1037,7 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
       if (!file) return;
       var url = URL.createObjectURL(file);
       var img = new Image();
-      img.onload = function () {
+      img.onload = async function () {
         try {
           var c = document.createElement("canvas");
           c.width = img.width; c.height = img.height;
@@ -1268,7 +1045,7 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
           ctx.drawImage(img, 0, 0);
           var idata = ctx.getImageData(0, 0, c.width, c.height);
           var res = window.TaiJsQrLib && window.TaiJsQrLib(idata.data, c.width, c.height, { inversionAttempts: "attemptBoth" });
-          if (res && res.data) validateAcceptanceQr(res.data);
+          if (res && res.data) await validateAcceptanceQr(res.data);
           else setFeedback("No se detectó un QR válido en la imagen.", "warn");
         } finally {
           URL.revokeObjectURL(url);
@@ -1285,66 +1062,54 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
         return;
       }
 
-      var enc = new TextEncoder();
-      var eventId = generateEventId();
       var localTimestamp = new Date().toISOString();
       var nextSeq = offlineQueue.filter(function (q) { return q.packageId === validatedQr.packageId; }).length + 1;
+      var delivererName = $("deliverer-name").value.trim().slice(0, 120);
+      var receiverName = $("receiver-name").value.trim().slice(0, 120);
+      var zone = $("zone-name").value.trim().slice(0, 120);
+      var functionRole = $("function-role").value.trim().slice(0, 120);
+      var observations = $("observations").value.trim().slice(0, 500);
 
-      var payload = {
-        v: "TAI-CVV-OFFLINE-HTML-1",
+      var sealed = await CryptoEngine.sealTransferEvent({
         packageId: validatedQr.packageId,
-        eventId: eventId,
         eventType: validatedQr.eventType,
-        delivererName: $("deliverer-name").value.trim().slice(0, 120),
-        receiverName: $("receiver-name").value.trim().slice(0, 120),
-        zone: $("zone-name").value.trim().slice(0, 120),
-        functionRole: $("function-role").value.trim().slice(0, 120),
+        delivererName: delivererName,
+        receiverName: receiverName,
+        zone: zone,
+        functionRole: functionRole,
         acceptanceNonce: validatedQr.nonce,
         localTimestamp: localTimestamp,
-        observations: $("observations").value.trim().slice(0, 500),
-        capturedOffline: true,
-        deviceId: session.deviceId,
-        operatorUid: session.operator.uid,
-        operatorEmail: session.operator.email
-      };
-
-      var iv = crypto.getRandomValues(new Uint8Array(12));
-      var aad = enc.encode(payload.packageId + ":" + payload.eventId);
-      var encryptedBuf = await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: iv, additionalData: aad, tagLength: 128 },
-        session.aesKey,
-        enc.encode(JSON.stringify(payload))
-      );
-
-      var encBytes = new Uint8Array(encryptedBuf);
-      var ctBytes = encBytes.slice(0, encBytes.length - 16);
-      var tagBytes = encBytes.slice(encBytes.length - 16);
-      var authTagHex = bytesToHex(tagBytes);
-
-      var canonical = [payload.packageId, payload.eventId, payload.eventType, payload.acceptanceNonce, authTagHex].join("|");
-      var csgBuf = await crypto.subtle.sign("HMAC", session.hmacKey, enc.encode(canonical));
+        observations: observations,
+        acceptanceProof: validatedQr.proof
+      }, session);
 
       var item = {
-        localId: "LOC_" + Date.now() + "_" + bytesToHex(crypto.getRandomValues(new Uint8Array(2))),
-        eventId: eventId,
+        localId: "LOC_" + Date.now() + "_" + CryptoEngine.bytesToHex(crypto.getRandomValues(new Uint8Array(2))),
+        eventId: sealed.eventId,
         packageId: validatedQr.packageId,
         packageCode: validatedQr.packageCode,
         eventType: validatedQr.eventType,
-        delivererName: payload.delivererName,
-        receiverName: payload.receiverName,
-        zone: payload.zone,
-        functionRole: payload.functionRole,
-        observations: payload.observations,
+        delivererName: delivererName,
+        receiverName: receiverName,
+        zone: zone,
+        functionRole: functionRole,
+        observations: observations,
         acceptanceNonce: validatedQr.nonce,
         offlineSequence: nextSeq,
         deviceId: session.deviceId,
         localTimestamp: localTimestamp,
         sealStatus: $("seal-status").value,
         discrepancyNote: $("discrepancy-note").value.trim().slice(0, 400),
-        cvvCiphertext: bytesToHex(ctBytes),
-        cvvIv: bytesToHex(iv),
-        cvvAuthTag: authTagHex,
-        csgSeal: bytesToHex(new Uint8Array(csgBuf))
+        cvvCiphertext: sealed.cvvCiphertext,
+        cvvIv: sealed.cvvIv,
+        cvvAuthTag: sealed.cvvAuthTag,
+        csgSeal: sealed.csgSeal,
+        acceptanceHash: validatedQr.acceptanceHash,
+        acceptanceCryptoId: validatedQr.acceptanceCryptoId,
+        receiverUid: validatedQr.receiverUid,
+        receiverKeyId: validatedQr.proof ? validatedQr.proof.receiverKeyId : "",
+        receiverSignature: validatedQr.proof ? validatedQr.proof.signatureB64u : "",
+        proof: sealed.proof
       };
 
       offlineQueue.push(item);
@@ -1356,8 +1121,8 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
       $("validated-qr-banner").className = "alert";
       $("validated-qr-banner").textContent = "Captura y valida el QR de aceptación del receptor antes de generar el CVV.";
       acceptanceNonce = generateNonce();
-      renderAcceptanceQr();
-      setFeedback("CVV " + eventId + " generado localmente con credencial protegida y guardado en cola offline (Seq #" + nextSeq + ").", "ok");
+      void renderAcceptanceQr();
+      setFeedback("CVV " + sealed.eventId + " generado localmente con firma ECDSA de estación #" + session.stationKeyId + " y guardado en cola offline (Seq #" + nextSeq + ").", "ok");
     });
 
     $("btn-export-batch").addEventListener("click", function () {
@@ -1368,6 +1133,9 @@ function buildStandaloneHtmlDocument(bundlePayload: unknown): string {
         operatorUid: session.operator.uid,
         operatorEmail: session.operator.email,
         deviceId: session.deviceId,
+        stationKeyId: session.stationKeyId,
+        stationPublicKeyB64u: session.stationPublicKeyB64u,
+        stationCert: session.stationCert || null,
         events: offlineQueue
       };
       var blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: "application/json" });

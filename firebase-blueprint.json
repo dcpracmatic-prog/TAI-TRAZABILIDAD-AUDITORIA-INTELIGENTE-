@@ -215,6 +215,26 @@
           "type": "string",
           "maxLength": 400
         },
+        "acceptanceHash": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "acceptanceCryptoId": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "receiverUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "receiverKeyId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "receiverSignature": {
+          "type": "string",
+          "maxLength": 256
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"

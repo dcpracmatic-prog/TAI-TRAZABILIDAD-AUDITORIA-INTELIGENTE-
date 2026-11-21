@@ -122,7 +122,7 @@ export function OverviewSection({
               Trazabilidad físico-digital de cierre y transferencias sin reemplazar SAP MM, Infor WMS ni Unigis TMS
             </h1>
             <p className="mt-3 max-w-2xl text-sm leading-relaxed text-slate-600">
-              TAI vincula el cierre físico de cartón de cada unidad logística con un QR identificador, una bitácora visible y un comprobante de validación (CVV) sellado mediante AES-256-GCM y CSG, capaz de operar sin conectividad continua.
+              TAI vincula el cierre físico de cartón de cada unidad logística con un QR identificador, una bitácora visible y un comprobante de validación (CVV) sellado en Web Crypto (AES-256-GCM, firmas ECDSA P-256 y sello HMAC-SHA256 compatible con la arquitectura CSG, sin enlazar aún el crate Rust <code className="font-mono text-xs">sello_integridad</code>), capaz de operar sin conectividad continua.
             </p>
           </div>
 

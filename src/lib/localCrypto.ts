@@ -1,16 +1,33 @@
+import {
+  base64UrlEncode,
+  computeKeyThumbprint,
+  decryptOfflineQueueBlob,
+  encryptOfflineQueueBlob,
+  generateEcdsaIdentityKeyPair,
+} from './offlineCrypto';
 import type { TraceEventType } from '../types/tai';
 
 const DB_NAME = 'tai_device_keystore_v1';
 const STORE_NAME = 'keys';
 const AES_KEY_ID = 'tai_aes_256_gcm_key';
 const HMAC_KEY_ID = 'tai_csg_hmac_sha256_key';
+const ECDSA_PRIV_ID = 'tai_ecdsa_p256_private_key';
+const ECDSA_PUB_ID = 'tai_ecdsa_p256_public_key';
 
 interface DeviceKeys {
   aesKey: CryptoKey;
   hmacKey: CryptoKey;
 }
 
+export interface DeviceSigningIdentity {
+  privateKey: CryptoKey;
+  publicKey: CryptoKey;
+  publicKeyB64u: string;
+  keyId: string;
+}
+
 let inMemoryFallbackKeys: DeviceKeys | null = null;
+let inMemorySigningIdentity: DeviceSigningIdentity | null = null;
 
 function openKeyDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -94,6 +111,74 @@ async function getOrCreateDeviceKeys(): Promise<DeviceKeys> {
   }
 }
 
+export async function getDeviceSigningIdentity(): Promise<DeviceSigningIdentity> {
+  if (inMemorySigningIdentity) return inMemorySigningIdentity;
+
+  try {
+    const db = await openKeyDb();
+    let privateKey = await idbGet<CryptoKey>(db, ECDSA_PRIV_ID);
+    let publicKey = await idbGet<CryptoKey>(db, ECDSA_PUB_ID);
+
+    if (!privateKey || !publicKey) {
+      const generated = await generateEcdsaIdentityKeyPair(false);
+      privateKey = generated.privateKey;
+      publicKey = generated.publicKey;
+      await idbPut(db, ECDSA_PRIV_ID, privateKey);
+      await idbPut(db, ECDSA_PUB_ID, publicKey);
+    }
+
+    const spki = new Uint8Array(await crypto.subtle.exportKey('spki', publicKey));
+    const publicKeyB64u = base64UrlEncode(spki);
+    const keyId = await computeKeyThumbprint(spki);
+
+    inMemorySigningIdentity = {
+      privateKey,
+      publicKey,
+      publicKeyB64u,
+      keyId,
+    };
+    return inMemorySigningIdentity;
+  } catch {
+    const generated = await generateEcdsaIdentityKeyPair(false);
+    inMemorySigningIdentity = {
+      privateKey: generated.privateKey,
+      publicKey: generated.publicKey,
+      publicKeyB64u: generated.publicKeyB64u,
+      keyId: generated.keyId,
+    };
+    return inMemorySigningIdentity;
+  }
+}
+
+export async function encryptForDeviceStorage(
+  aadContext: string,
+  value: unknown
+): Promise<string> {
+  const { aesKey } = await getOrCreateDeviceKeys();
+  const blob = await encryptOfflineQueueBlob(value, { aesKey }, aadContext);
+  return JSON.stringify({ v: 'TAI-ENC-CACHE-V1', ...blob });
+}
+
+export async function decryptFromDeviceStorage<T>(
+  aadContext: string,
+  raw: string
+): Promise<T | null> {
+  try {
+    const parsed = JSON.parse(raw) as { v?: string; iv?: string; ct?: string };
+    if (!parsed || parsed.v !== 'TAI-ENC-CACHE-V1' || !parsed.iv || !parsed.ct) {
+      return null;
+    }
+    const { aesKey } = await getOrCreateDeviceKeys();
+    return await decryptOfflineQueueBlob<T>(
+      { iv: parsed.iv, ct: parsed.ct },
+      { aesKey },
+      aadContext
+    );
+  } catch {
+    return null;
+  }
+}
+
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, '0'))
@@ -123,6 +208,13 @@ export interface LocalCvvSealInput {
   observations: string;
   capturedOffline: boolean;
   deviceId: string;
+  receiverSignatureMeta?: {
+    receiverUid: string;
+    receiverKeyId: string;
+    receiverSignature: string;
+    acceptanceHash: string;
+    acceptanceCryptoId: string;
+  };
 }
 
 export interface LocalCvvSealOutput {
@@ -150,6 +242,15 @@ export async function sealCvvLocally(input: LocalCvvSealInput): Promise<LocalCvv
     observations: input.observations.slice(0, 500),
     capturedOffline: input.capturedOffline,
     deviceId: input.deviceId,
+    ...(input.receiverSignatureMeta
+      ? {
+          receiverUid: input.receiverSignatureMeta.receiverUid.slice(0, 128),
+          receiverKeyId: input.receiverSignatureMeta.receiverKeyId.slice(0, 64),
+          receiverSignature: input.receiverSignatureMeta.receiverSignature.slice(0, 256),
+          acceptanceHash: input.receiverSignatureMeta.acceptanceHash.slice(0, 128),
+          acceptanceCryptoId: input.receiverSignatureMeta.acceptanceCryptoId.slice(0, 160),
+        }
+      : {}),
   };
 
   const encoder = new TextEncoder();
