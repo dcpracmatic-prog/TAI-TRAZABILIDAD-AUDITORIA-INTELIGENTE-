@@ -1,0 +1,6 @@
+{
+  "name": "TAI — Trazabilidad y Auditoría Inteligente",
+  "description": "Plataforma piloto físico-digital para trazabilidad de unidades logísticas, sellado criptográfico AES-256-GCM + CSG, recepción offline y auditoría en Google Sheets para el reto YPF.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

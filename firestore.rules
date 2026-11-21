@@ -1,0 +1,257 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny all by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.email == 'dcpracmatic@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 3 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidPackage(data) {
+      return data.keys().hasAll([
+        'id', 'code', 'ownerId', 'ownerEmail', 'fromArea', 'targetArea',
+        'zone', 'contentSummary', 'quantity', 'unit', 'identificationStatus',
+        'sealStatus', 'lifecycleStatus', 'qrPayload', 'observations',
+        'cvvId', 'eventCount', 'createdAt', 'updatedAt'
+      ]) && data.keys().hasOnly([
+        'id', 'code', 'ownerId', 'ownerEmail', 'fromArea', 'targetArea',
+        'zone', 'contentSummary', 'quantity', 'unit', 'identificationStatus',
+        'sealStatus', 'lifecycleStatus', 'qrPayload', 'observations',
+        'cvvId', 'eventCount', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.code is string && data.code.size() >= 3 && data.code.size() <= 64 &&
+      data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+      data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 160 &&
+      data.fromArea is string && data.fromArea.size() >= 1 && data.fromArea.size() <= 120 &&
+      data.targetArea is string && data.targetArea.size() >= 1 && data.targetArea.size() <= 120 &&
+      data.zone is string && data.zone.size() >= 1 && data.zone.size() <= 120 &&
+      data.contentSummary is string && data.contentSummary.size() >= 1 && data.contentSummary.size() <= 300 &&
+      data.quantity is number && data.quantity >= 0 && data.quantity <= 1000000 &&
+      data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 40 &&
+      data.identificationStatus in ['verified', 'uncertain_pending'] &&
+      data.sealStatus in ['intact', 'opened', 'damaged'] &&
+      data.lifecycleStatus in ['packed', 'in_transit', 'received', 'return_open', 'conflict', 'audited'] &&
+      data.qrPayload is string && data.qrPayload.size() >= 5 && data.qrPayload.size() <= 200 &&
+      data.observations is string && data.observations.size() <= 500 &&
+      data.cvvId is string && data.cvvId.size() <= 128 &&
+      data.eventCount is number && data.eventCount >= 0 && data.eventCount <= 10000 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidTraceEvent(data, packageId) {
+      return data.keys().hasAll([
+        'id', 'packageId', 'ownerId', 'eventType', 'delivererName',
+        'receiverName', 'zone', 'functionRole', 'observations',
+        'acceptanceNonce', 'capturedOffline', 'offlineSequence',
+        'localTimestamp', 'cvvCiphertext', 'cvvIv', 'cvvAuthTag',
+        'csgSeal', 'cvvState', 'discrepancyNote', 'createdAt'
+      ]) && data.keys().hasOnly([
+        'id', 'packageId', 'ownerId', 'eventType', 'delivererName',
+        'receiverName', 'zone', 'functionRole', 'observations',
+        'acceptanceNonce', 'capturedOffline', 'offlineSequence',
+        'localTimestamp', 'cvvCiphertext', 'cvvIv', 'cvvAuthTag',
+        'csgSeal', 'cvvState', 'discrepancyNote', 'createdAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.packageId == packageId &&
+      data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+      data.eventType in ['pack', 'dispatch', 'receive', 'return', 'material_validation', 'csg_invalidation', 'conflict_detected'] &&
+      data.delivererName is string && data.delivererName.size() >= 1 && data.delivererName.size() <= 120 &&
+      data.receiverName is string && data.receiverName.size() >= 1 && data.receiverName.size() <= 120 &&
+      data.zone is string && data.zone.size() >= 1 && data.zone.size() <= 120 &&
+      data.functionRole is string && data.functionRole.size() >= 1 && data.functionRole.size() <= 120 &&
+      data.observations is string && data.observations.size() <= 500 &&
+      data.acceptanceNonce is string && data.acceptanceNonce.size() >= 4 && data.acceptanceNonce.size() <= 128 &&
+      data.capturedOffline is bool &&
+      data.offlineSequence is number && data.offlineSequence >= 0 && data.offlineSequence <= 1000000 &&
+      data.localTimestamp is string && data.localTimestamp.size() >= 4 && data.localTimestamp.size() <= 64 &&
+      data.cvvCiphertext is string && data.cvvCiphertext.size() >= 1 && data.cvvCiphertext.size() <= 2000 &&
+      data.cvvIv is string && data.cvvIv.size() >= 1 && data.cvvIv.size() <= 64 &&
+      data.cvvAuthTag is string && data.cvvAuthTag.size() >= 1 && data.cvvAuthTag.size() <= 64 &&
+      data.csgSeal is string && data.csgSeal.size() >= 1 && data.csgSeal.size() <= 128 &&
+      data.cvvState in ['valid', 'invalidated_csg', 'conflict'] &&
+      data.discrepancyNote is string && data.discrepancyNote.size() <= 400 &&
+      data.createdAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll([
+        'id', 'ownerId', 'packageId', 'eventId', 'action',
+        'severity', 'detail', 'actorEmail', 'createdAt'
+      ]) && data.keys().hasOnly([
+        'id', 'ownerId', 'packageId', 'eventId', 'action',
+        'severity', 'detail', 'actorEmail', 'createdAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+      isValidId(data.packageId) &&
+      data.eventId is string && data.eventId.size() <= 128 &&
+      data.action in ['cvv_issued', 'cvv_verified', 'csg_tamper_invalidated', 'offline_conflict', 'sheets_synced', 'material_confirmed'] &&
+      data.severity in ['info', 'warning', 'critical'] &&
+      data.detail is string && data.detail.size() >= 1 && data.detail.size() <= 500 &&
+      data.actorEmail is string && data.actorEmail.size() >= 3 && data.actorEmail.size() <= 160 &&
+      data.createdAt is timestamp;
+    }
+
+    function isValidPilotConfig(data, userId) {
+      return data.keys().hasAll([
+        'ownerId', 'solverOrg', 'boxSupplier', 'trlLevel',
+        'pilotFacility', 'spreadsheetId', 'spreadsheetTitle', 'updatedAt'
+      ]) && data.keys().hasOnly([
+        'ownerId', 'solverOrg', 'boxSupplier', 'trlLevel',
+        'pilotFacility', 'spreadsheetId', 'spreadsheetTitle', 'updatedAt'
+      ]) &&
+      data.ownerId == userId &&
+      data.solverOrg is string && data.solverOrg.size() <= 160 &&
+      data.boxSupplier is string && data.boxSupplier.size() <= 160 &&
+      data.trlLevel is string && data.trlLevel.size() <= 64 &&
+      data.pilotFacility is string && data.pilotFacility.size() <= 160 &&
+      data.spreadsheetId is string && data.spreadsheetId.size() <= 128 &&
+      data.spreadsheetTitle is string && data.spreadsheetTitle.size() <= 200 &&
+      data.updatedAt is timestamp;
+    }
+
+    match /packages/{packageId} {
+      allow get: if isSignedIn() && isValidId(packageId) && (isAdmin() || existing().ownerId == request.auth.uid);
+      allow list: if isSignedIn() && (isAdmin() || resource.data.ownerId == request.auth.uid);
+
+      allow create: if isSignedIn() &&
+        isValidId(packageId) &&
+        isValidPackage(incoming()) &&
+        incoming().id == packageId &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().ownerEmail == request.auth.token.email &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn() &&
+        isValidId(packageId) &&
+        isValidPackage(incoming()) &&
+        (isAdmin() || existing().ownerId == request.auth.uid) &&
+        incoming().id == existing().id &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().ownerEmail == existing().ownerEmail &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (existing().lifecycleStatus != 'audited' || isAdmin()) &&
+        (
+          isAdmin() ||
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'lifecycleStatus', 'sealStatus', 'targetArea', 'zone',
+            'observations', 'cvvId', 'eventCount', 'updatedAt'
+          ]) ||
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'identificationStatus', 'contentSummary', 'quantity', 'observations', 'updatedAt'
+          ])
+        );
+
+      allow delete: if false;
+
+      match /events/{eventId} {
+        allow get: if isSignedIn() &&
+          isValidId(packageId) &&
+          isValidId(eventId) &&
+          (
+            isAdmin() ||
+            get(/databases/$(database)/documents/packages/$(packageId)).data.ownerId == request.auth.uid
+          );
+
+        allow list: if isSignedIn() && (isAdmin() || resource.data.ownerId == request.auth.uid);
+
+        allow create: if isSignedIn() &&
+          isValidId(packageId) &&
+          isValidId(eventId) &&
+          isValidTraceEvent(incoming(), packageId) &&
+          incoming().id == eventId &&
+          incoming().ownerId == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          exists(/databases/$(database)/documents/packages/$(packageId)) &&
+          (
+            isAdmin() ||
+            get(/databases/$(database)/documents/packages/$(packageId)).data.ownerId == request.auth.uid
+          );
+
+        allow update: if isSignedIn() &&
+          isValidId(packageId) &&
+          isValidId(eventId) &&
+          isValidTraceEvent(incoming(), packageId) &&
+          (
+            isAdmin() ||
+            get(/databases/$(database)/documents/packages/$(packageId)).data.ownerId == request.auth.uid
+          ) &&
+          incoming().id == existing().id &&
+          incoming().packageId == existing().packageId &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          (existing().cvvState != 'invalidated_csg' || isAdmin()) &&
+          (
+            isAdmin() ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['cvvState', 'discrepancyNote'])
+          );
+
+        allow delete: if false;
+      }
+    }
+
+    match /auditLogs/{logId} {
+      allow get: if isSignedIn() && isValidId(logId) && (isAdmin() || existing().ownerId == request.auth.uid);
+      allow list: if isSignedIn() && (isAdmin() || resource.data.ownerId == request.auth.uid);
+
+      allow create: if isSignedIn() &&
+        isValidId(logId) &&
+        isValidAuditLog(incoming()) &&
+        incoming().id == logId &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time;
+
+      allow update, delete: if false;
+    }
+
+    match /pilotConfigs/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isAdmin() || userId == request.auth.uid);
+      allow list: if isSignedIn() && (isAdmin() || resource.data.ownerId == request.auth.uid);
+
+      allow create: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidPilotConfig(incoming(), userId) &&
+        (isAdmin() || userId == request.auth.uid) &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidPilotConfig(incoming(), userId) &&
+        (isAdmin() || userId == request.auth.uid) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'solverOrg', 'boxSupplier', 'trlLevel', 'pilotFacility',
+          'spreadsheetId', 'spreadsheetTitle', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+  }
+}

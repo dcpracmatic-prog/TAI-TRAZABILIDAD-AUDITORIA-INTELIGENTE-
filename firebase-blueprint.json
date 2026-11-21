@@ -1,0 +1,382 @@
+{
+  "entities": {
+    "Package": {
+      "title": "Package",
+      "description": "Unidad logística equipada con cierre físico TAI y código QR identificador.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "code": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "ownerEmail": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "fromArea": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "targetArea": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "zone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "contentSummary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "quantity": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "identificationStatus": {
+          "type": "string",
+          "enum": ["verified", "uncertain_pending"]
+        },
+        "sealStatus": {
+          "type": "string",
+          "enum": ["intact", "opened", "damaged"]
+        },
+        "lifecycleStatus": {
+          "type": "string",
+          "enum": ["packed", "in_transit", "received", "return_open", "conflict", "audited"]
+        },
+        "qrPayload": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 200
+        },
+        "observations": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "cvvId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "eventCount": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "code",
+        "ownerId",
+        "ownerEmail",
+        "fromArea",
+        "targetArea",
+        "zone",
+        "contentSummary",
+        "quantity",
+        "unit",
+        "identificationStatus",
+        "sealStatus",
+        "lifecycleStatus",
+        "qrPayload",
+        "observations",
+        "cvvId",
+        "eventCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TraceEvent": {
+      "title": "TraceEvent",
+      "description": "Evento de trazabilidad de transferencia, recepción offline, devolución o auditoría vinculado a un paquete y sellado con CVV.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "packageId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "eventType": {
+          "type": "string",
+          "enum": [
+            "pack",
+            "dispatch",
+            "receive",
+            "return",
+            "material_validation",
+            "csg_invalidation",
+            "conflict_detected"
+          ]
+        },
+        "delivererName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "receiverName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "zone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "functionRole": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "observations": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "acceptanceNonce": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 128
+        },
+        "capturedOffline": {
+          "type": "boolean"
+        },
+        "offlineSequence": {
+          "type": "number"
+        },
+        "localTimestamp": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 64
+        },
+        "cvvCiphertext": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "cvvIv": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "cvvAuthTag": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "csgSeal": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "cvvState": {
+          "type": "string",
+          "enum": ["valid", "invalidated_csg", "conflict"]
+        },
+        "discrepancyNote": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "packageId",
+        "ownerId",
+        "eventType",
+        "delivererName",
+        "receiverName",
+        "zone",
+        "functionRole",
+        "observations",
+        "acceptanceNonce",
+        "capturedOffline",
+        "offlineSequence",
+        "localTimestamp",
+        "cvvCiphertext",
+        "cvvIv",
+        "cvvAuthTag",
+        "csgSeal",
+        "cvvState",
+        "discrepancyNote",
+        "createdAt"
+      ]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Registro maestro inmutable de auditoría conservado independientemente de la invalidación CSG.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "packageId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64
+        },
+        "eventId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "cvv_issued",
+            "cvv_verified",
+            "csg_tamper_invalidated",
+            "offline_conflict",
+            "sheets_synced",
+            "material_confirmed"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warning", "critical"]
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "actorEmail": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "packageId",
+        "eventId",
+        "action",
+        "severity",
+        "detail",
+        "actorEmail",
+        "createdAt"
+      ]
+    },
+    "PilotConfig": {
+      "title": "PilotConfig",
+      "description": "Configuración privada del Solver, proveedor de maquila, TRL y hoja vinculada de Google Sheets.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "solverOrg": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "boxSupplier": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "trlLevel": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "pilotFacility": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "spreadsheetId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "spreadsheetTitle": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "solverOrg",
+        "boxSupplier",
+        "trlLevel",
+        "pilotFacility",
+        "spreadsheetId",
+        "spreadsheetTitle",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/packages/{packageId}": {
+      "schema": { "$ref": "#/entities/Package" },
+      "description": "Unidades logísticas registradas por el operador en el piloto TAI."
+    },
+    "/packages/{packageId}/events/{eventId}": {
+      "schema": { "$ref": "#/entities/TraceEvent" },
+      "description": "Historial inmutable de eventos de transferencia, recepción offline y devoluciones."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Bitácora maestra de auditoría conservada ante invalidaciones CSG o conflictos."
+    },
+    "/pilotConfigs/{userId}": {
+      "schema": { "$ref": "#/entities/PilotConfig" },
+      "description": "Configuración de propuesta Solver y vinculación a Google Sheets del usuario."
+    }
+  }
+}
